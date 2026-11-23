@@ -3,20 +3,22 @@ Merchant Acquiring Dashboard (Total = Card PF/DM + QRPH)
 Run: streamlit run app.py
 Requirements: streamlit>=1.50, pandas, plotly, openpyxl
 
-Data sources (auto-detected by columns - upload in ONE sidebar box, or keep defaults in the repo)
-  * Card MIS CSV : YEAR_MONTH, PF_DM_TAG, PF_DM_NAME, MERCHANT_NAME_ORIG, INDUSTRY, TRXN_CODE, TOTAL_VOLUME,
-                   TOTAL_COUNT, MDR, INTERCHANGE_RATE, INTERCHANGE_EXPENSE_PHP
-  * QRPH sheet   : YEAR_MONTH, VOLUME_POSTED, TXN_COUNT_POSTED (other columns ignored)
+Data sources - found automatically in the repo (root, data/, data/qrph/, data/card/) by COLUMN HEADERS,
+or uploaded in the sidebar (also auto-detected):
+  * Card MIS : YEAR_MONTH, PF_DM_TAG, PF_DM_NAME, MERCHANT_NAME_ORIG, INDUSTRY, TRXN_CODE, TOTAL_VOLUME,
+               TOTAL_COUNT, MDR, INTERCHANGE_RATE, INTERCHANGE_EXPENSE_PHP
+  * QRPH     : YEAR_MONTH, VOLUME_POSTED, TXN_COUNT_POSTED (other columns ignored)
 
 Run-rate rule (per source): ONLY each source's latest month is run-rated (MTD x days / as-of day).
 Every prior month (incl. MoM / YoY / YTD LY bases) = actual, simple summation.
 
 Chart convention for the run-rated month:
-  * Bars : solid = MTD actual, hatched orange-tinted segment on top = run-rate uplift, label "RR ₱x" = full run-rate
+  * Bars : solid = MTD actual, hatched lighter segment on top = run-rate uplift, label "RR ₱x" = full run-rate
   * Lines: solid line = actuals, dotted line + ★ = run-rate, open circle = MTD actual
 """
 import calendar
 import os
+import re
 from datetime import date
 
 import pandas as pd
@@ -25,8 +27,8 @@ import streamlit as st
 
 st.set_page_config(page_title="Merchant Acquiring Dashboard", layout="wide")
 
-# Repo files are found automatically: every .csv / .xlsx in these folders is checked and classified by its
-# column headers (file name doesn't matter). If several files of the same type exist, the newest one is used.
+# Every .csv / .xlsx in these folders is classified by its headers (file name doesn't matter).
+# If several files of the same type exist, the most recently modified one is used.
 SCAN_DIRS = [".", "data", "data/qrph", "data/card"]
 TAG_COLORS = {"Direct Merchant": "#F28C28", "Payment Facilitator": "#1F4E79"}
 SRC_COLORS = {"Card (PF + DM)": "#1F4E79", "QRPH": "#2E8B57"}
@@ -43,37 +45,13 @@ SUB_COL = "MERCHANT_NAME_ORIG"
 MON = calendar.month_abbr
 RR_LEGEND = ("Run-rated month: **solid** = MTD actual, **hatched / dotted ★** = run-rate, "
              "**open ○** = MTD actual point. Ratios (MDR, interchange rate, ticket size) are not run-rated.")
+SEPS = [",", ";", "\t", "|"]
 
 
 # ================================================================ LOADING
-def _detect_sep(src, enc):
-    """Delimiter from the header line (comma, semicolon, tab or pipe)."""
-    if hasattr(src, "seek"):
-        src.seek(0)
-        line = src.readline()
-        src.seek(0)
-        line = line.decode(enc, errors="replace") if isinstance(line, bytes) else line
-    else:
-        with open(src, encoding=enc, errors="replace") as fh:
-            line = fh.readline()
-    return max([",", ";", "\t", "|"], key=line.count)
-
-
-def _read_any(src, name):
-    if str(name).lower().endswith((".xlsx", ".xls")):
-        return pd.read_excel(src)
-    for enc in ("utf-8-sig", "cp1252"):
-        try:
-            if hasattr(src, "seek"):
-                src.seek(0)
-            return pd.read_csv(src, encoding=enc, low_memory=False, sep=_detect_sep(src, enc))
-        except UnicodeDecodeError:
-            continue
-    raise ValueError(f"{name}: could not decode file")
-
-
 def _clean_col(c):
-    return str(c).replace("\ufeff", "").replace("ï»¿", "").strip().strip('"').upper()
+    c = str(c).replace("\ufeff", "").replace("ï»¿", "").strip().strip('"').strip("'").upper()
+    return re.sub(r"[^A-Z0-9]+", "_", c).strip("_")       # "Volume Posted" -> VOLUME_POSTED
 
 
 def classify(cols):
@@ -83,6 +61,41 @@ def classify(cols):
     if set(QRPH_REQUIRED) <= cols:
         return "qrph"
     return None
+
+
+def _header_row(lines):
+    """Index of the first line that looks like the header (contains YEAR_MONTH); skips title rows."""
+    for i, ln in enumerate(lines[:15]):
+        if "YEAR_MONTH" in {_clean_col(x) for x in re.split(r"[,;\t|]", ln)}:
+            return i
+    return 0
+
+
+def _read_any(src, name):
+    if str(name).lower().endswith((".xlsx", ".xls")):
+        raw = pd.read_excel(src, header=None, nrows=15)
+        skip = next((i for i in range(len(raw))
+                     if "YEAR_MONTH" in {_clean_col(x) for x in raw.iloc[i].astype(str)}), 0)
+        if hasattr(src, "seek"):
+            src.seek(0)
+        return pd.read_excel(src, skiprows=skip)
+    for enc in ("utf-8-sig", "cp1252"):
+        try:
+            if hasattr(src, "seek"):
+                src.seek(0)
+                head = src.read(20000)
+                src.seek(0)
+                head = head.decode(enc) if isinstance(head, bytes) else head
+            else:
+                with open(src, encoding=enc) as fh:
+                    head = fh.read(20000)
+            lines = head.splitlines()
+            skip = _header_row(lines)
+            sep = max(SEPS, key=(lines[skip] if lines else "").count)
+            return pd.read_csv(src, encoding=enc, low_memory=False, sep=sep, skiprows=skip)
+        except UnicodeDecodeError:
+            continue
+    raise ValueError(f"{name}: could not decode file")
 
 
 def _norm_ym(s):
@@ -134,6 +147,42 @@ def load_sources(files):
                 .agg(VOLUME=("VOLUME_POSTED", "sum"), TXN_COUNT=("TXN_COUNT_POSTED", "sum"))
                 .sort_values("YEAR_MONTH"))
     return cdf, qdf, log
+
+
+def _sniff_header(path):
+    if path.lower().endswith((".xlsx", ".xls")):
+        return list(_read_any(path, path).columns)
+    for enc in ("utf-8-sig", "cp1252"):
+        try:
+            with open(path, encoding=enc) as fh:
+                lines = [fh.readline() for _ in range(15)]
+            ln = lines[_header_row(lines)].strip()
+            return ln.split(max(SEPS, key=ln.count))
+        except UnicodeDecodeError:
+            continue
+    return []
+
+
+@st.cache_data(ttl=300)
+def scan_repo():
+    found, allf = {}, []
+    for d in SCAN_DIRS:
+        if not os.path.isdir(d):
+            continue
+        for f in sorted(os.listdir(d)):
+            p = os.path.normpath(os.path.join(d, f))
+            if not f.lower().endswith((".csv", ".xlsx", ".xls")) or f.startswith("~$") or p in [a[0] for a in allf]:
+                continue
+            try:
+                hdr = _sniff_header(p)
+                kind = classify(hdr)
+            except Exception as e:
+                hdr, kind = [f"read error: {e}"], None
+            allf.append((p, kind, [_clean_col(h) for h in hdr][:12]))
+            if kind and (kind not in found or os.path.getmtime(p) > os.path.getmtime(found[kind])):
+                found[kind] = p
+    found["_all"] = allf
+    return found
 
 
 # ================================================================ GENERIC HELPERS
@@ -201,6 +250,10 @@ def fmt_bps(x):
     return "n/a" if pd.isna(x) else f"{x:+.1f}"
 
 
+def fmt_rate(x):
+    return "-" if pd.isna(x) else f"{x:.2%}"
+
+
 def safe_div(a, b):
     return a / b if pd.notna(a) and pd.notna(b) and b != 0 else float("nan")
 
@@ -215,7 +268,6 @@ def month_picker_date(label, ym, default_day, key):
 
 # ================================================================ RUN-RATE CHART HELPERS
 def expand_rr(g, val):
-    """Rows with _F != 1 are split into 'Actual (MTD)' + 'Run-rate uplift' (= MTD x (F-1))."""
     a = g[g["_F"] == 1].assign(BASIS="Actual")
     r = g[g["_F"] != 1]
     mtd = r.assign(BASIS="Actual (MTD)")
@@ -225,17 +277,18 @@ def expand_rr(g, val):
 
 
 def bar_rr(g, cat, val, title, color=None, cmap=None, horizontal=False, fmt=fmt_php, height=None):
-    """Bar chart of ACTUAL values in g (needs column _F). Run-rated rows get a hatched uplift segment + 'RR' label."""
+    """Bar chart of ACTUAL values (needs _F). Run-rated rows get a hatched uplift segment + 'RR' label."""
     long = expand_rr(g, val)
     xy = dict(x=val, y=cat, orientation="h") if horizontal else dict(x=cat, y=val)
+    pat = dict(pattern_shape="BASIS",
+               pattern_shape_map={"Actual": "", "Actual (MTD)": "", "Run-rate uplift": "/"})
     if color is None:
         fig = px.bar(long, **xy, color="BASIS", title=title, category_orders={"BASIS": BASIS_ORDER},
                      color_discrete_map={"Actual": "#1F4E79", "Actual (MTD)": "#1F4E79", "Run-rate uplift": RR_COLOR},
-                     pattern_shape="BASIS", pattern_shape_map={"Actual": "", "Actual (MTD)": "", "Run-rate uplift": "/"})
+                     **pat)
     else:
         fig = px.bar(long, **xy, color=color, title=title, color_discrete_map=cmap or {},
-                     category_orders={"BASIS": BASIS_ORDER},
-                     pattern_shape="BASIS", pattern_shape_map={"Actual": "", "Actual (MTD)": "", "Run-rate uplift": "/"})
+                     category_orders={"BASIS": BASIS_ORDER}, **pat)
     for tr in fig.data:
         if "Run-rate uplift" in (tr.name or ""):
             tr.marker.opacity = 0.55
@@ -260,15 +313,12 @@ def bar_rr(g, cat, val, title, color=None, cmap=None, horizontal=False, fmt=fmt_
 
 
 def line_rr(g, x, y, title, color=None, order=None, cum=False, y_rr=None, tickformat=None, cmap=None):
-    """Line of ACTUALS; for run-rated rows (_F != 1) draws dotted connector to a ★ run-rate point + ○ MTD actual."""
+    """Line of ACTUALS; run-rated rows (_F != 1) get a dotted connector to a ★ run-rate point + ○ MTD actual."""
     g = g.copy().sort_values("YEAR_MONTH")
     if color is None:
         g["Series"] = "Total"
         color = "Series"
-    if y_rr is None:
-        g["_YRR"] = g[y] * g["_F"]
-    else:
-        g["_YRR"] = g[y_rr]
+    g["_YRR"] = g[y] * g["_F"] if y_rr is None else g[y_rr]
     if cum:
         g["_CUMA"] = g.groupby(color)[y].cumsum()
         g["_YRR"] = g["_CUMA"] + (g["_YRR"] - g[y])
@@ -308,53 +358,18 @@ def add_period_cols(g):
 
 
 def yoy_bar(g, title):
-    """Monthly volume YoY % for CY; run-rated month computed on RR volume and coloured differently."""
     g = g.copy().sort_values("YEAR_MONTH")
     g["_VRR"] = g.VOLUME * g["_F"]
     ly = g.set_index("YEAR_MONTH")["_VRR"]
     g["YOY%"] = [safe_div(v, ly.get(prev_month(m, 12))) - 1 for m, v in zip(g.YEAR_MONTH, g._VRR)]
     cy = g[g.YEAR == str(CY)].copy()
     cy["BASIS"] = cy["_F"].ne(1).map({True: "Run-rate", False: "Actual"})
-    fig = px.bar(cy, x="MONTH", y="YOY%", color="BASIS", title=title, text=cy["YOY%"].map(lambda v: fmt_pct(v)),
+    fig = px.bar(cy, x="MONTH", y="YOY%", color="BASIS", title=title, text=cy["YOY%"].map(fmt_pct),
                  category_orders={"MONTH": list(MON)[1:]},
                  color_discrete_map={"Actual": "#1F4E79", "Run-rate": RR_COLOR})
     fig.update_traces(textposition="outside")
     fig.update_layout(legend_title_text="").update_yaxes(tickformat=".0%")
     return fig
-
-
-# ================================================================ REPO SCAN
-def _sniff_header(path):
-    if path.lower().endswith((".xlsx", ".xls")):
-        return pd.read_excel(path, nrows=0).columns
-    for enc in ("utf-8-sig", "cp1252"):
-        try:
-            return pd.read_csv(path, nrows=0, encoding=enc, sep=None, engine="python").columns
-        except UnicodeDecodeError:
-            continue
-    return []
-
-
-@st.cache_data(ttl=300)
-def scan_repo():
-    """Classify every csv/xlsx in SCAN_DIRS by header. Returns {'card': path, 'qrph': path, '_all': [(path, kind)]}."""
-    found, allf = {}, []
-    for d in SCAN_DIRS:
-        if not os.path.isdir(d):
-            continue
-        for f in sorted(os.listdir(d)):
-            p = os.path.normpath(os.path.join(d, f))
-            if not f.lower().endswith((".csv", ".xlsx", ".xls")) or f.startswith("~$") or p in dict(allf):
-                continue
-            try:
-                kind = classify(_sniff_header(p))
-            except Exception:
-                kind = None
-            allf.append((p, kind))
-            if kind and (kind not in found or os.path.getmtime(p) > os.path.getmtime(found[kind])):
-                found[kind] = p
-    found["_all"] = allf
-    return found
 
 
 # ================================================================ SIDEBAR – DATA
@@ -366,10 +381,7 @@ files = [(u.name, u) for u in uploads] if uploads else []
 up_kinds = set()
 for u in uploads or []:
     try:
-        hdr = (pd.read_excel(u, nrows=0) if u.name.lower().endswith("xlsx")
-               else pd.read_csv(u, nrows=0, encoding="utf-8-sig", encoding_errors="replace",
-                                sep=None, engine="python")).columns
-        up_kinds.add(classify(hdr))
+        up_kinds.add(classify(_read_any(u, u.name).columns))
     except Exception:
         pass
     u.seek(0)
@@ -377,11 +389,18 @@ repo_found = scan_repo()
 for kind in ("card", "qrph"):
     if kind not in up_kinds and kind in repo_found:
         files.append((repo_found[kind], repo_found[kind]))
-with st.sidebar.expander("Repo files detected", expanded=False):
-    for p, k in repo_found.get("_all", []):
-        st.caption(f"{'✅' if k else '–'} `{p}` → {k or 'not a Card MIS / QRPH file'}")
+with st.sidebar.expander("Repo files detected", expanded="qrph" not in repo_found or "card" not in repo_found):
+    for p, k, hdr in repo_found.get("_all", []):
+        if k:
+            st.caption(f"✅ `{p}` → {k}")
+        else:
+            st.caption(f"⚠️ `{p}` → not recognised. Header read: `{', '.join(hdr) or '(empty)'}`")
     if not repo_found.get("_all"):
         st.caption("No .csv / .xlsx found in " + ", ".join(SCAN_DIRS))
+    if st.button("Re-scan repo files"):
+        scan_repo.clear()
+        load_sources.clear()
+        st.rerun()
 if not files:
     st.info("Upload the Card MIS CSV and/or the QRPH sheet in the sidebar.")
     st.stop()
@@ -462,11 +481,9 @@ def period_table(d, by):
     return t
 
 
-def trend_actual(d, by=None, upto=True):
-    """Monthly ACTUALS (no scaling) with _F run-rate factor column for charting."""
+def trend_actual(d, by=None):
     keys = ["YEAR_MONTH"] + ([by] if by else [])
-    dd = d[d.YEAR_MONTH <= cur_m] if upto else d
-    g = summarize(dd, keys)
+    g = summarize(d[d.YEAR_MONTH <= cur_m], keys)
     g["_F"] = g["YEAR_MONTH"].map(month_factor)
     return add_period_cols(g)
 
@@ -580,14 +597,34 @@ def kpi_row(t):
     c = st.columns(6)
     c[0].metric(VOL_LBL, fmt_php(r.VOLUME), f"{fmt_pct(r['VOLUME_MoM%'])} MoM | {fmt_pct(r['VOLUME_YoY%'])} YoY")
     c[1].metric(TXN_LBL, fmt_int(r.TXN_COUNT), f"{fmt_pct(r['TXN_COUNT_MoM%'])} MoM | {fmt_pct(r['TXN_COUNT_YoY%'])} YoY")
-    c[2].metric("Weighted MDR", f"{r.WEIGHTED_MDR:.2%}" if pd.notna(r.WEIGHTED_MDR) else "-",
+    c[2].metric("Weighted MDR", fmt_rate(r.WEIGHTED_MDR),
                 f"{fmt_bps(r.WEIGHTED_MDR_MoM_bps)} bps MoM | {fmt_bps(r.WEIGHTED_MDR_YoY_bps)} YoY")
-    c[3].metric("Blended MDR (simple avg)", f"{r.BLENDED_MDR:.2%}" if pd.notna(r.BLENDED_MDR) else "-",
+    c[3].metric("Blended MDR (simple avg)", fmt_rate(r.BLENDED_MDR),
                 f"{fmt_bps(r.BLENDED_MDR_MoM_bps)} bps MoM | {fmt_bps(r.BLENDED_MDR_YoY_bps)} YoY")
-    c[4].metric("Weighted Interchange", f"{r.WEIGHTED_IC:.2%}" if pd.notna(r.WEIGHTED_IC) else "-",
+    c[4].metric("Weighted Interchange", fmt_rate(r.WEIGHTED_IC),
                 f"{fmt_bps(r.WEIGHTED_IC_MoM_bps)} bps MoM | {fmt_bps(r.WEIGHTED_IC_YoY_bps)} YoY", delta_color="inverse")
     c[5].metric(IC_LBL, fmt_php(r.INTERCHANGE_PHP),
                 f"{fmt_pct(r['INTERCHANGE_PHP_MoM%'])} MoM | {fmt_pct(r['INTERCHANGE_PHP_YoY%'])} YoY", delta_color="inverse")
+
+
+def ytd_kpi_block(d, label):
+    """YTD CY vs YTD LY + FY outlook for any card slice (merchant, sub-merchant, ...)."""
+    t = ytd_compare(d.assign(ALL=label), "ALL").iloc[0]
+    small_ly = pd.isna(t.VOLUME_LY) or t.VOLUME_LY < MIN_LY_BASE
+    vol_yoy = "n.m. (LY base too small)" if small_ly else f"{fmt_pct(t['VOLUME_YoY%'])} YoY"
+    c = st.columns(6)
+    c[0].metric(f"YTD Volume {CY}", fmt_php(t.VOLUME), f"{vol_yoy} (LY {fmt_php(t.VOLUME_LY)})",
+                delta_color="off" if small_ly else "normal")
+    c[1].metric(f"YTD Txn Count {CY}", fmt_int(t.TXN_COUNT),
+                f"{fmt_pct(t['TXN_COUNT_YoY%'])} YoY (LY {fmt_int(t.TXN_COUNT_LY)})")
+    c[2].metric("YTD Weighted MDR", fmt_rate(t.WEIGHTED_MDR),
+                f"{fmt_bps(t.WEIGHTED_MDR_YoY_bps)} bps YoY (LY {fmt_rate(t.WEIGHTED_MDR_LY)})")
+    c[3].metric("YTD Weighted IC", fmt_rate(t.WEIGHTED_IC),
+                f"{fmt_bps(t.WEIGHTED_IC_YoY_bps)} bps YoY (LY {fmt_rate(t.WEIGHTED_IC_LY)})", delta_color="inverse")
+    c[4].metric(f"YTD Interchange ₱ {CY}", fmt_php(t.INTERCHANGE_PHP),
+                f"{fmt_pct(t['INTERCHANGE_PHP_YoY%'])} YoY", delta_color="inverse")
+    c[5].metric(f"FY {CY} Volume (RR)", fmt_php(t.VOLUME_FY),
+                f"{fmt_pct(t['VOLUME_FY_YoY%'])} vs FY {LY} {fmt_php(t.VOLUME_FYLY)}")
 
 
 DISPLAY_COLS = {
@@ -638,7 +675,7 @@ def need_card():
 
 
 def rr_snapshot(g, cat, val_rr):
-    """From a run-rated snapshot table (e.g. period_table output) build an ACTUAL frame with _F for bar_rr."""
+    """From a run-rated snapshot table build an ACTUAL frame with _F for bar_rr."""
     out = g[[cat] + ([c for c in ["PF_DM_NAME"] if c in g.columns and c != cat])].copy()
     out[val_rr] = g[val_rr] / CUR_FACTOR
     out["_F"] = CUR_FACTOR
@@ -660,7 +697,6 @@ tab_tot, tab_yoy, tab_ovw, tab_cat, tab_mer, tab_qr = st.tabs(
     ["1 · Total Acquiring (Card + QRPH)", "2 · Card YoY & YTD", "3 · PF vs DM Overview",
      "4 · Category Mix", "5 · Merchant Level", "6 · QRPH"])
 
-# actual monthly series with run-rate factor per source
 card_a = None
 if HAS_CARD:
     card_a = summarize(df, "YEAR_MONTH")[["YEAR_MONTH", "VOLUME", "TXN_COUNT"]]
@@ -689,7 +725,6 @@ with tab_tot:
         st.warning("Month coverage differs – " + "; ".join(f"no {n} for {g}" for n, g in gaps.items() if g)
                    + ". YTD totals needing those months show '-'.")
 
-    # total series: MTD actual and RR (each source scaled by its own factor)
     tot = pd.DataFrame({"YEAR_MONTH": both.YEAR_MONTH})
     tot["VOLUME"] = sum(both[f"V_{n}"] for n in parts_a)
     tot["TXN_COUNT"] = sum(both[f"N_{n}"] for n in parts_a)
@@ -757,18 +792,8 @@ with tab_yoy:
         d4 = df if seg4 == "All" else df[df.PF_DM_TAG == seg4]
         st.caption(f"YTD {CY} = {ytd_lbl} {CY} (latest month run-rated) vs {ytd_lbl} {LY} actual. "
                    f"FY outlook = YTD ÷ {END_MM} × 12.")
-        t = ytd_compare(d4.assign(ALL="Total"), "ALL").iloc[0]
         st.subheader(f"YTD {ytd_lbl}: {CY} vs {LY}")
-        c = st.columns(5)
-        c[0].metric(f"YTD Volume {CY}", fmt_php(t.VOLUME), f"{fmt_pct(t['VOLUME_YoY%'])} YoY (LY {fmt_php(t.VOLUME_LY)})")
-        c[1].metric(f"YTD Txn Count {CY}", fmt_int(t.TXN_COUNT), f"{fmt_pct(t['TXN_COUNT_YoY%'])} YoY (LY {fmt_int(t.TXN_COUNT_LY)})")
-        c[2].metric("YTD Weighted MDR", f"{t.WEIGHTED_MDR:.2%}", f"{fmt_bps(t.WEIGHTED_MDR_YoY_bps)} bps YoY")
-        c[3].metric("YTD Weighted IC", f"{t.WEIGHTED_IC:.2%}", f"{fmt_bps(t.WEIGHTED_IC_YoY_bps)} bps YoY", delta_color="inverse")
-        c[4].metric(f"YTD Interchange ₱ {CY}", fmt_php(t.INTERCHANGE_PHP), f"{fmt_pct(t['INTERCHANGE_PHP_YoY%'])} YoY", delta_color="inverse")
-        c = st.columns(3)
-        c[0].metric(f"FY {CY} Volume (RR)", fmt_php(t.VOLUME_FY), f"{fmt_pct(t['VOLUME_FY_YoY%'])} vs FY {LY} {fmt_php(t.VOLUME_FYLY)}")
-        c[1].metric(f"FY {CY} Txn Count (RR)", fmt_int(t.TXN_COUNT_FY), f"{fmt_pct(t['TXN_COUNT_FY_YoY%'])} vs FY {LY}")
-        c[2].metric(f"FY {CY} Interchange ₱ (RR)", fmt_php(t.INTERCHANGE_PHP_FY), f"{fmt_pct(t['INTERCHANGE_PHP_FY_YoY%'])} vs FY {LY}", delta_color="inverse")
+        ytd_kpi_block(d4, "Total")
 
         m_all = trend_actual(d4)
         m = year_filter(m_all, "yr_tab4")
@@ -901,7 +926,9 @@ with tab_mer:
                     show_table(subt.assign(**{"Vol Share": subt["Share of PF"]}), ["PF_DM_NAME", SUB_COL, "Vol Share"])
                     st.caption("'Vol Share' here = share of the sub-merchant within its PF.")
 
+        # ---------------- per-merchant drill-down: YoY & YTD first, then MoM
         st.divider()
+        st.subheader("Merchant drill-down")
         cA, cB = st.columns(2)
         pick = cA.selectbox(f"Drill down: {seg3}", mer.PF_DM_NAME.dropna().tolist(), key="drill_pf")
         dd = d3[d3.PF_DM_NAME == pick]
@@ -913,15 +940,42 @@ with tab_mer:
             if sub_pick != "All":
                 dd = dd[dd[SUB_COL] == sub_pick]
         label = pick if sub_pick == "All" else f"{pick} › {sub_pick}"
-        kpi_row(period_table(dd.assign(ALL=label), "ALL"))
-        trd = trend_actual(dd).sort_values("YEAR_MONTH")
+        trd_all = trend_actual(dd)
+
+        # ---- (1) YoY & YTD
+        st.markdown(f"#### ① YoY & YTD – {label}")
+        st.caption(f"YTD {ytd_lbl} {CY}{' (incl. run-rated ' + MON[END_MM] + ')' if CUR_FACTOR != 1 else ''} "
+                   f"vs YTD {ytd_lbl} {LY} actual · FY outlook = YTD ÷ {END_MM} × 12 vs FY {LY} actual")
+        ytd_kpi_block(dd, label)
+        trd_y = year_filter(trd_all, "yr_drill")
         c1, c2 = st.columns(2)
-        c1.plotly_chart(bar_rr(trd, "LABEL", "VOLUME", f"{label} – Monthly Volume"), width="stretch")
+        c1.plotly_chart(line_rr(trd_y, "MONTH", "VOLUME", f"{label} – Monthly Volume by Year", color="YEAR",
+                                order=ORDER_M), width="stretch")
+        c2.plotly_chart(line_rr(trd_y, "MONTH", "VOLUME", f"{label} – Cumulative YTD Volume by Year", color="YEAR",
+                                order=ORDER_M, cum=True), width="stretch")
+        c3, c4 = st.columns(2)
+        c3.plotly_chart(yoy_bar(trd_all, f"{label} – Monthly Volume YoY % ({CY} vs {LY})"), width="stretch")
+        c4.plotly_chart(px.line(trd_y, x="MONTH", y="WEIGHTED_MDR", color="YEAR", markers=True,
+                                category_orders=ORDER_M, title=f"{label} – Weighted MDR by Year (not run-rated)")
+                        .update_yaxes(tickformat=".2%"), width="stretch")
+        if seg3 == "Payment Facilitator" and sub_pick == "All":
+            st.markdown(f"**YTD YoY – sub-merchants under {pick}**")
+            sy = ytd_compare(dd, SUB_COL)
+            sy.loc[sy.VOLUME_LY.fillna(0) < MIN_LY_BASE, "VOLUME_YoY%"] = float("nan")
+            show_ytd(sy.sort_values("VOLUME", ascending=False), SUB_COL)
+
+        # ---- (2) Month on month
+        st.markdown(f"#### ② Month on month – {label}: {cur_m}{' (RR)' if CUR_FACTOR != 1 else ''} vs {mom_m}")
+        kpi_row(period_table(dd.assign(ALL=label), "ALL"))
+        trd = trd_all.sort_values("YEAR_MONTH")
+        trd = trd[trd.YEAR_MONTH >= prev_month(cur_m, 12)]
+        c1, c2 = st.columns(2)
+        c1.plotly_chart(bar_rr(trd, "LABEL", "VOLUME", f"{label} – Monthly Volume (last 13 months)"), width="stretch")
         c2.plotly_chart(px.line(trd, x="LABEL", y=["WEIGHTED_MDR", "WEIGHTED_IC"], markers=True,
                                 title=f"{label} – Weighted MDR vs Interchange (not run-rated)")
                         .update_yaxes(tickformat=".2%").update_xaxes(type="category"), width="stretch")
         if seg3 == "Payment Facilitator" and sub_pick == "All":
-            st.markdown(f"**Sub-merchants under {pick}**")
+            st.markdown(f"**MoM – sub-merchants under {pick}**")
             show_table(period_table(dd, SUB_COL).sort_values("VOLUME", ascending=False), SUB_COL)
 
 # ================================================================ TAB 6 – QRPH
