@@ -25,8 +25,9 @@ import streamlit as st
 
 st.set_page_config(page_title="Merchant Acquiring Dashboard", layout="wide")
 
-CARD_PATH = "MACQ - MIS_2026-11-19-0907 (1).csv"
-QRPH_PATH = "data/qrph/QRPH_MIS.csv"
+# Repo files are found automatically: every .csv / .xlsx in these folders is checked and classified by its
+# column headers (file name doesn't matter). If several files of the same type exist, the newest one is used.
+SCAN_DIRS = [".", "data", "data/qrph", "data/card"]
 TAG_COLORS = {"Direct Merchant": "#F28C28", "Payment Facilitator": "#1F4E79"}
 SRC_COLORS = {"Card (PF + DM)": "#1F4E79", "QRPH": "#2E8B57"}
 RR_COLOR = "#E8541E"
@@ -45,21 +46,38 @@ RR_LEGEND = ("Run-rated month: **solid** = MTD actual, **hatched / dotted ★** 
 
 
 # ================================================================ LOADING
+def _detect_sep(src, enc):
+    """Delimiter from the header line (comma, semicolon, tab or pipe)."""
+    if hasattr(src, "seek"):
+        src.seek(0)
+        line = src.readline()
+        src.seek(0)
+        line = line.decode(enc, errors="replace") if isinstance(line, bytes) else line
+    else:
+        with open(src, encoding=enc, errors="replace") as fh:
+            line = fh.readline()
+    return max([",", ";", "\t", "|"], key=line.count)
+
+
 def _read_any(src, name):
     if str(name).lower().endswith((".xlsx", ".xls")):
         return pd.read_excel(src)
-    for enc in ("utf-8", "cp1252"):
+    for enc in ("utf-8-sig", "cp1252"):
         try:
             if hasattr(src, "seek"):
                 src.seek(0)
-            return pd.read_csv(src, encoding=enc, low_memory=False)
+            return pd.read_csv(src, encoding=enc, low_memory=False, sep=_detect_sep(src, enc))
         except UnicodeDecodeError:
             continue
     raise ValueError(f"{name}: could not decode file")
 
 
+def _clean_col(c):
+    return str(c).replace("\ufeff", "").replace("ï»¿", "").strip().strip('"').upper()
+
+
 def classify(cols):
-    cols = {str(c).strip().upper() for c in cols}
+    cols = {_clean_col(c) for c in cols}
     if set(CARD_REQUIRED) <= cols:
         return "card"
     if set(QRPH_REQUIRED) <= cols:
@@ -81,7 +99,7 @@ def load_sources(files):
     card, qr, log = [], [], []
     for name, src in files:
         d = _read_any(src, name)
-        d.columns = d.columns.astype(str).str.strip().str.upper()
+        d.columns = [_clean_col(c) for c in d.columns]
         kind = classify(d.columns)
         if kind == "card":
             card.append(d)
@@ -305,6 +323,40 @@ def yoy_bar(g, title):
     return fig
 
 
+# ================================================================ REPO SCAN
+def _sniff_header(path):
+    if path.lower().endswith((".xlsx", ".xls")):
+        return pd.read_excel(path, nrows=0).columns
+    for enc in ("utf-8-sig", "cp1252"):
+        try:
+            return pd.read_csv(path, nrows=0, encoding=enc, sep=None, engine="python").columns
+        except UnicodeDecodeError:
+            continue
+    return []
+
+
+@st.cache_data(ttl=300)
+def scan_repo():
+    """Classify every csv/xlsx in SCAN_DIRS by header. Returns {'card': path, 'qrph': path, '_all': [(path, kind)]}."""
+    found, allf = {}, []
+    for d in SCAN_DIRS:
+        if not os.path.isdir(d):
+            continue
+        for f in sorted(os.listdir(d)):
+            p = os.path.normpath(os.path.join(d, f))
+            if not f.lower().endswith((".csv", ".xlsx", ".xls")) or f.startswith("~$") or p in dict(allf):
+                continue
+            try:
+                kind = classify(_sniff_header(p))
+            except Exception:
+                kind = None
+            allf.append((p, kind))
+            if kind and (kind not in found or os.path.getmtime(p) > os.path.getmtime(found[kind])):
+                found[kind] = p
+    found["_all"] = allf
+    return found
+
+
 # ================================================================ SIDEBAR – DATA
 st.sidebar.title("Settings")
 uploads = st.sidebar.file_uploader(
@@ -315,15 +367,21 @@ up_kinds = set()
 for u in uploads or []:
     try:
         hdr = (pd.read_excel(u, nrows=0) if u.name.lower().endswith("xlsx")
-               else pd.read_csv(u, nrows=0, encoding="latin-1")).columns
+               else pd.read_csv(u, nrows=0, encoding="utf-8-sig", encoding_errors="replace",
+                                sep=None, engine="python")).columns
         up_kinds.add(classify(hdr))
     except Exception:
         pass
     u.seek(0)
-if "card" not in up_kinds and os.path.exists(CARD_PATH):
-    files.append((CARD_PATH, CARD_PATH))
-if "qrph" not in up_kinds and os.path.exists(QRPH_PATH):
-    files.append((QRPH_PATH, QRPH_PATH))
+repo_found = scan_repo()
+for kind in ("card", "qrph"):
+    if kind not in up_kinds and kind in repo_found:
+        files.append((repo_found[kind], repo_found[kind]))
+with st.sidebar.expander("Repo files detected", expanded=False):
+    for p, k in repo_found.get("_all", []):
+        st.caption(f"{'✅' if k else '–'} `{p}` → {k or 'not a Card MIS / QRPH file'}")
+    if not repo_found.get("_all"):
+        st.caption("No .csv / .xlsx found in " + ", ".join(SCAN_DIRS))
 if not files:
     st.info("Upload the Card MIS CSV and/or the QRPH sheet in the sidebar.")
     st.stop()
