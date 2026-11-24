@@ -1,5 +1,5 @@
 """
-Merchant Acquiring Dashboard (Total = Card PF/DM + QRPH)
+Merchant Acquiring Dashboard (Total = Card PF/DM + QRPH)   – profitability map lives in profit_app.py
 Run: streamlit run app.py
 Requirements: streamlit>=1.50, pandas, plotly, openpyxl
 
@@ -11,13 +11,9 @@ or uploaded in the sidebar (also auto-detected):
   * QRPH     : YEAR_MONTH, VOLUME_POSTED, TXN_COUNT_POSTED (other columns ignored)
 
 Run-rate rule (per source): ONLY each source's latest month is run-rated (MTD x days / as-of day).
-  Card as-of day = latest MAX_TRAN_DATE within the latest YEAR_MONTH (read from the file; can be overridden).
 Every prior month (incl. MoM / YoY / YTD LY bases) = actual, simple summation.
-
-Chart convention for the run-rated month:
-  * Bars : solid = MTD actual, hatched lighter segment on top = run-rate uplift, label "RR ₱x" = full run-rate
-  * Lines: solid line = actuals, dotted line + ★ = run-rate, open circle = MTD actual
-Rate charts (MDR / interchange): y-axis spans at least RATE_MIN_SPAN_BPS so sub-bp noise doesn't look like movement.
+Resource use: only needed columns are read, rows are pre-aggregated, data is cached once (cache_resource),
+and only the selected section is rendered.
 """
 import calendar
 import os
@@ -26,7 +22,9 @@ from datetime import date
 
 import numpy as np
 import pandas as pd
+import plotly.colors as pc
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 from streamlit.delta_generator import DeltaGenerator as _DG
 
@@ -49,6 +47,7 @@ SCAN_DIRS = [".", "data", "data/qrph", "data/card"]
 TAG_COLORS = {"Direct Merchant": "#F28C28", "Payment Facilitator": "#1F4E79"}
 SRC_COLORS = {"Card (PF + DM)": "#1F4E79", "QRPH": "#2E8B57"}
 RR_COLOR = "#E8541E"
+NM_GREY = "#BDBDBD"
 BASIS_ORDER = ["Actual", "Actual (MTD)", "Run-rate uplift"]
 FLOW_COLS = ["VOLUME", "TXN_COUNT", "INTERCHANGE_PHP"]
 CAT_TOP_N = 10
@@ -66,10 +65,9 @@ MON = calendar.month_abbr
 RR_LEGEND = ("Run-rated month: **solid** = MTD actual, **hatched / dotted ★** = run-rate, "
              "**open ○** = MTD actual point. Ratios (MDR, interchange rate, ticket size) are not run-rated.")
 SEPS = [",", ";", "\t", "|"]
-QUAD_COLORS = {"① Protect – high volume, above hurdle": "#2E8B57",
-               "② Fix – high volume, below hurdle": "#C0392B",
-               "③ Grow – low volume, above hurdle": "#2F80ED",
-               "④ Review – low volume, below hurdle": "#F2994A"}
+PROFIT_APP_URL = ""      # paste the Profitability Map app URL here to show a link in the sidebar
+KEEP_COLS = set(CARD_REQUIRED + QRPH_REQUIRED + [DATE_COL, SUB_COL, "CARD_ACCEPTOR_ID"])
+AGG_KEYS = ["YEAR_MONTH", "PF_DM_TAG", "PF_DM_NAME", SUB_COL, MID_COL, "INDUSTRY", "TRXN_CODE"]
 
 
 # ================================================================ LOADING
@@ -94,14 +92,14 @@ def _header_row(lines):
     return 0
 
 
-def _read_any(src, name):
+def _read_any(src, name, nrows=None):
     if str(name).lower().endswith((".xlsx", ".xls")):
         raw = pd.read_excel(src, header=None, nrows=15)
         skip = next((i for i in range(len(raw))
                      if "YEAR_MONTH" in {_clean_col(x) for x in raw.iloc[i].astype(str)}), 0)
         if hasattr(src, "seek"):
             src.seek(0)
-        return pd.read_excel(src, skiprows=skip)
+        return pd.read_excel(src, skiprows=skip, nrows=nrows, usecols=lambda c: _clean_col(c) in KEEP_COLS)
     for enc in ("utf-8-sig", "cp1252"):
         try:
             if hasattr(src, "seek"):
@@ -115,7 +113,8 @@ def _read_any(src, name):
             lines = head.splitlines()
             skip = _header_row(lines)
             sep = max(SEPS, key=(lines[skip] if lines else "").count)
-            return pd.read_csv(src, encoding=enc, low_memory=False, sep=sep, skiprows=skip,
+            return pd.read_csv(src, encoding=enc, low_memory=False, sep=sep, skiprows=skip, nrows=nrows,
+                               usecols=lambda c: _clean_col(c) in KEEP_COLS,
                                dtype={"CARD_ACCEPTOR_ID": str, "MAX_TRAN_DATE": str})
         except UnicodeDecodeError:
             continue
@@ -157,7 +156,7 @@ def _parse_dates(s):
     return out
 
 
-@st.cache_data(show_spinner="Loading files…")
+@st.cache_resource(show_spinner="Loading files…", max_entries=2)
 def load_sources(files):
     card, qr, log = [], [], []
     for name, src in files:
@@ -182,13 +181,22 @@ def load_sources(files):
             cdf[c] = pd.to_numeric(cdf[c].astype(str).str.replace(",", ""), errors="coerce").fillna(0)
         if SUB_COL not in cdf.columns:
             cdf[SUB_COL] = cdf["PF_DM_NAME"]
-        cdf[SUB_COL] = cdf[SUB_COL].fillna("UNTAGGED").astype(str).str.strip()
         cdf[MID_COL] = _norm_mid(cdf["CARD_ACCEPTOR_ID"]) if "CARD_ACCEPTOR_ID" in cdf.columns else "NO MID"
         if DATE_COL in cdf.columns:
             cdf[DATE_COL] = _parse_dates(cdf[DATE_COL])
         cdf["MDR_X_VOL"] = cdf["MDR"] * cdf["TOTAL_VOLUME"]
         cdf["IC_X_VOL"] = cdf["INTERCHANGE_RATE"] * cdf["TOTAL_VOLUME"]
         cdf["INTERCHANGE_PHP"] = -cdf["INTERCHANGE_EXPENSE_PHP"]
+        cdf = cdf.dropna(subset=["YEAR_MONTH"])
+        for k in AGG_KEYS[1:]:
+            cdf[k] = cdf[k].fillna("UNTAGGED").astype(str).str.strip()
+        aggs = dict(TOTAL_VOLUME=("TOTAL_VOLUME", "sum"), TOTAL_COUNT=("TOTAL_COUNT", "sum"),
+                    MDR_X_VOL=("MDR_X_VOL", "sum"), IC_X_VOL=("IC_X_VOL", "sum"),
+                    INTERCHANGE_PHP=("INTERCHANGE_PHP", "sum"),
+                    MDR_SUM=("MDR", "sum"), IC_SUM=("INTERCHANGE_RATE", "sum"), N_ROWS=("MDR", "size"))
+        if DATE_COL in cdf.columns:
+            aggs[DATE_COL] = (DATE_COL, "max")
+        cdf = cdf.groupby(AGG_KEYS, as_index=False, sort=False).agg(**aggs)
 
     qdf = None
     if qr:
@@ -205,7 +213,7 @@ def load_sources(files):
 
 def _sniff_header(path):
     if path.lower().endswith((".xlsx", ".xls")):
-        return list(_read_any(path, path).columns)
+        return list(_read_any(path, path, nrows=5).columns)
     for enc in ("utf-8-sig", "cp1252"):
         try:
             with open(path, encoding=enc) as fh:
@@ -247,11 +255,13 @@ def summarize(d, by):
         VOLUME=("TOTAL_VOLUME", "sum"), TXN_COUNT=("TOTAL_COUNT", "sum"),
         MDR_X_VOL=("MDR_X_VOL", "sum"), IC_X_VOL=("IC_X_VOL", "sum"),
         INTERCHANGE_PHP=("INTERCHANGE_PHP", "sum"),
-        BLENDED_MDR=("MDR", "mean"), BLENDED_IC=("INTERCHANGE_RATE", "mean"),
+        MDR_SUM=("MDR_SUM", "sum"), IC_SUM=("IC_SUM", "sum"), N_ROWS=("N_ROWS", "sum"),
     ).reset_index()
+    g["BLENDED_MDR"] = g.MDR_SUM / g.N_ROWS
+    g["BLENDED_IC"] = g.IC_SUM / g.N_ROWS
     g["WEIGHTED_MDR"] = g["MDR_X_VOL"] / g["VOLUME"].where(g["VOLUME"] != 0)
     g["WEIGHTED_IC"] = g["IC_X_VOL"] / g["VOLUME"].where(g["VOLUME"] != 0)
-    return g.drop(columns=["MDR_X_VOL", "IC_X_VOL"])
+    return g.drop(columns=["MDR_X_VOL", "IC_X_VOL", "MDR_SUM", "IC_SUM", "N_ROWS"])
 
 
 def prev_month(ym, n=1):
@@ -322,7 +332,7 @@ def month_picker_date(label, ym, default_day, key):
     return dim / d.day, d
 
 
-# ================================================================ RATE CHARTS
+# ================================================================ CHART HELPERS
 def rate_line(d, x, y, title, color=None, order=None, cmap=None):
     ys = y if isinstance(y, list) else [y]
     d = d.copy()
@@ -345,7 +355,6 @@ def rate_line(d, x, y, title, color=None, order=None, cmap=None):
     return fig
 
 
-# ================================================================ RUN-RATE CHART HELPERS
 def expand_rr(g, val):
     a = g[g["_F"] == 1].assign(BASIS="Actual")
     r = g[g["_F"] != 1]
@@ -451,6 +460,8 @@ def yoy_bar(g, title):
 
 # ================================================================ SIDEBAR – DATA
 st.sidebar.title("Settings")
+if PROFIT_APP_URL:
+    st.sidebar.markdown(f"[📈 Open the Profitability Map app]({PROFIT_APP_URL})")
 uploads = st.sidebar.file_uploader(
     "Upload data files – Card MIS CSV and/or QRPH sheet (auto-detected)",
     type=["csv", "xlsx"], accept_multiple_files=True, key="uploads")
@@ -458,20 +469,16 @@ files = [(u.name, u) for u in uploads] if uploads else []
 up_kinds = set()
 for u in uploads or []:
     try:
-        up_kinds.add(classify(_read_any(u, u.name).columns))
+        up_kinds.add(classify(_read_any(u, u.name, nrows=5).columns))
     except Exception:
         pass
     u.seek(0)
 repo_found = scan_repo()
-
 if "card" not in up_kinds and repo_found["card"]:
     cands = repo_found["card"]
-    if len(cands) > 1:
-        card_file = st.sidebar.selectbox(
-            "Card MIS file to use", cands, index=0, key="card_file",
-            help=f"Several card files found in the repo. Files with a {DATE_COL} column are listed first.")
-    else:
-        card_file = cands[0]
+    card_file = (st.sidebar.selectbox("Card MIS file to use", cands, index=0, key="card_file",
+                                      help=f"Files with a {DATE_COL} column are listed first.")
+                 if len(cands) > 1 else cands[0])
     files.append((card_file, card_file))
 if "qrph" not in up_kinds and repo_found["qrph"]:
     files.append((repo_found["qrph"][0], repo_found["qrph"][0]))
@@ -501,7 +508,7 @@ for line in load_log:
     st.sidebar.caption(line)
 HAS_CARD, HAS_QR = card_raw is not None, qr is not None and not qr.empty
 if not HAS_CARD:
-    st.sidebar.warning("No Card MIS loaded – card tabs will be empty.")
+    st.sidebar.warning("No Card MIS loaded – card sections will be empty.")
 if not HAS_QR:
     st.sidebar.warning("No QRPH sheet loaded – QRPH figures will be empty.")
 
@@ -512,7 +519,7 @@ def data_max_tran_date(d, ym):
     s_all = d.loc[d["YEAR_MONTH"] == ym, DATE_COL]
     s = s_all.dropna()
     if s.empty:
-        return None, f"{DATE_COL} is blank / unreadable for {ym} ({len(s_all):,} rows)"
+        return None, f"{DATE_COL} is blank / unreadable for {ym}"
     p = pd.Period(ym, "M")
     s_in = s[(s >= p.start_time) & (s <= p.end_time)]
     if s_in.empty:
@@ -541,11 +548,6 @@ if HAS_CARD:
         RR_FACTOR, card_asof = month_picker_date(f"Card data as of ({LATEST_M})", LATEST_M, 14, "asof_card")
     st.sidebar.caption(f"Card run-rate ({LATEST_M} only): {dim_} / {card_asof.day} = **{RR_FACTOR:.3f}x**"
                        + (" (full month – no run-rate)" if RR_FACTOR == 1 else ""))
-    if DATE_COL in card_raw.columns:
-        with st.sidebar.expander(f"{DATE_COL} by month"):
-            mx = (card_raw.groupby("YEAR_MONTH")[DATE_COL].max().dropna().sort_index(ascending=False)
-                  .dt.strftime("%Y-%m-%d").rename("Max tran date").to_frame())
-            st.dataframe(mx, width="stretch", height=240)
 
 QR_LATEST, QR_RR = None, 1.0
 if HAS_QR:
@@ -657,6 +659,51 @@ def full_compare(d, by):
     t.loc[t["YTD__VOLUME_LY"].fillna(0) < MIN_LY_BASE, "YTD__VOLUME_YoY%"] = float("nan")
     t.loc[t["VOLUME_LY"].fillna(0) < MIN_LY_BASE / 10, "VOLUME_YoY%"] = float("nan")
     return t
+
+
+def yoy_treemap(d, root_label, title):
+    """PF → MID → sub-merchant treemap. Size = YTD CY volume. Colour = YTD volume YoY computed AT EACH NODE
+    from summed volumes (Σ CY ÷ Σ LY − 1) – the same formula as the KPI cards – NOT plotly's default
+    volume-weighted average of the children's growth rates. Grey = new / LY base < MIN_LY_BASE (n.m.)."""
+    lv0 = ytd_compare(d.assign(_ROOT=root_label), "_ROOT")
+    lv1 = ytd_compare(d, MID_COL)
+    lv2 = ytd_compare(d, [MID_COL, SUB_COL])
+    lv2 = lv2[lv2.VOLUME.fillna(0) > 0]
+    lv1 = lv1[lv1[MID_COL].isin(lv2[MID_COL])]
+    if lv2.empty:
+        return None
+
+    def yoy(cy, ly):
+        return float("nan") if pd.isna(ly) or ly < MIN_LY_BASE or pd.isna(cy) else cy / ly - 1
+
+    ids, labels, parents, vals, yo, cyv, lyv = [], [], [], [], [], [], []
+    sub_tot = lv2.groupby(MID_COL).VOLUME.sum()
+    r = lv0.iloc[0]
+    ids.append("root"); labels.append(root_label); parents.append("")
+    vals.append(sub_tot.sum()); yo.append(yoy(r.VOLUME, r.VOLUME_LY)); cyv.append(r.VOLUME); lyv.append(r.VOLUME_LY)
+    for _, m in lv1.iterrows():
+        ids.append(f"m|{m[MID_COL]}"); labels.append(f"MID {m[MID_COL]}"); parents.append("root")
+        vals.append(sub_tot.get(m[MID_COL], 0)); yo.append(yoy(m.VOLUME, m.VOLUME_LY))
+        cyv.append(m.VOLUME); lyv.append(m.VOLUME_LY)
+    for _, s_ in lv2.iterrows():
+        ids.append(f"s|{s_[MID_COL]}|{s_[SUB_COL]}"); labels.append(s_[SUB_COL]); parents.append(f"m|{s_[MID_COL]}")
+        vals.append(s_.VOLUME); yo.append(yoy(s_.VOLUME, s_.VOLUME_LY)); cyv.append(s_.VOLUME); lyv.append(s_.VOLUME_LY)
+
+    def col(v):
+        if pd.isna(v):
+            return NM_GREY
+        return pc.sample_colorscale("RdYlGn", [(max(-1.0, min(1.0, v)) + 1) / 2])[0]
+
+    yo_txt = [("n.m." if pd.isna(v) else f"{v:+.1%}") for v in yo]
+    custom = np.column_stack([yo_txt, [fmt_php(v) for v in cyv], [fmt_php(v) for v in lyv]])
+    fig = go.Figure(go.Treemap(
+        ids=ids, labels=labels, parents=parents, values=vals, branchvalues="total",
+        marker=dict(colors=[col(v) for v in yo]), customdata=custom,
+        texttemplate="%{label}<br>%{customdata[0]} YoY<br>%{percentParent:.1%} of parent",
+        hovertemplate="<b>%{label}</b><br>YTD " + str(CY) + ": %{customdata[1]}<br>YTD " + str(LY)
+                      + ": %{customdata[2]}<br>YoY: %{customdata[0]}<extra></extra>"))
+    fig.update_layout(title=title, height=560, margin=dict(t=50, l=5, r=5, b=5))
+    return fig
 
 
 # ================================================================ MONTHLY-SERIES LOGIC (QRPH / Total)
@@ -846,7 +893,7 @@ def show_full(t, keys, extra=None, height=None):
 
 def need_card():
     if not HAS_CARD:
-        st.info("Upload the Card MIS CSV in the sidebar to see this tab.")
+        st.info("Upload the Card MIS CSV in the sidebar to see this section.")
         return False
     return True
 
@@ -870,41 +917,7 @@ def ytd_vs_ly_bar(t, key, title, top=15):
         height=max(380, 32 * len(t)), legend_title_text="")
 
 
-# ================================================================ PROFITABILITY HELPERS
-def profit_table(d, keys):
-    """Per-entity volume and NET MDR REVENUE = Σ(MDR × volume) − Σ(interchange rate × volume)
-    = gross MDR revenue net of interchange. Margin (bps) = net MDR revenue ÷ volume × 10,000
-    (= volume-weighted MDR − interchange spread). Actuals – not run-rated."""
-    keys = keys if isinstance(keys, list) else [keys]
-    g = d.groupby(keys, dropna=False).agg(
-        VOLUME=("TOTAL_VOLUME", "sum"), TXN_COUNT=("TOTAL_COUNT", "sum"),
-        MDR_REV=("MDR_X_VOL", "sum"), IC_COST=("IC_X_VOL", "sum"),
-        MONTHS=("YEAR_MONTH", "nunique")).reset_index()
-    g = g[g.VOLUME > 0].copy()
-    g["NET_REV"] = g.MDR_REV - g.IC_COST
-    g["WTD_MDR"] = g.MDR_REV / g.VOLUME
-    g["WTD_IC"] = g.IC_COST / g.VOLUME
-    g["MARGIN_BPS"] = g.NET_REV / g.VOLUME * 1e4
-    g["TICKET"] = g.VOLUME / g.TXN_COUNT.where(g.TXN_COUNT > 0)
-    g["NET_REV_PER_TXN"] = g.NET_REV / g.TXN_COUNT.where(g.TXN_COUNT > 0)
-    g["NAME"] = g[keys].astype(str).agg(" › ".join, axis=1)
-    return g
-
-
-def assign_quadrants(g, pareto_pct, hurdle_bps):
-    g = g.sort_values("VOLUME", ascending=False).copy()
-    share = g.VOLUME / g.VOLUME.sum()
-    g["VOL_SHARE"] = share
-    g["HIGH_VOL"] = (share.cumsum() - share) < pareto_pct / 100      # merchants making up the top X% of volume
-    vol_cut = g.loc[g.HIGH_VOL, "VOLUME"].min() if g.HIGH_VOL.any() else g.VOLUME.max()
-    prof = g.MARGIN_BPS >= hurdle_bps
-    quads = list(QUAD_COLORS)
-    g["QUADRANT"] = np.select([g.HIGH_VOL & prof, g.HIGH_VOL & ~prof, ~g.HIGH_VOL & prof],
-                              quads[:3], default=quads[3])
-    return g, vol_cut
-
-
-# ================================================================ HEADER & TABS
+# ================================================================ HEADER & SECTIONS
 st.title("Merchant Acquiring Dashboard")
 notes = []
 if HAS_CARD:
@@ -915,10 +928,10 @@ st.caption(f"Reporting month: **{cur_m}** · MoM vs **{mom_m}** · YoY vs **{yoy
            + " · ".join(notes) + " · all earlier months are actuals")
 st.caption(RR_LEGEND)
 
-tab_tot, tab_yoy, tab_ovw, tab_cat, tab_mer, tab_pf, tab_prof, tab_qr = st.tabs(
-    ["1 · Total Acquiring (Card + QRPH)", "2 · Card YoY & YTD", "3 · PF vs DM Overview",
-     "4 · Category Mix", "5 · Merchant Level", "6 · PF Level (MID → Sub-merchant)", "7 · Profitability Map",
-     "8 · QRPH"])
+# Only the selected section is computed and rendered (st.tabs would build every chart on every click).
+PAGES = ["1 · Total Acquiring (Card + QRPH)", "2 · Card YoY & YTD", "3 · PF vs DM Overview",
+         "4 · Category Mix", "5 · Merchant Level", "6 · PF Level (MID → Sub-merchant)", "7 · QRPH"]
+PAGE = st.radio("Section", PAGES, horizontal=True, key="page", label_visibility="collapsed")
 
 card_a = None
 if HAS_CARD:
@@ -929,13 +942,12 @@ if HAS_QR:
     qr_a = qr[["YEAR_MONTH", "VOLUME", "TXN_COUNT"]].copy()
     qr_a["_F"] = qr_a.YEAR_MONTH.map(qr_factor)
 
-# ================================================================ TAB 1 – TOTAL ACQUIRING
-with tab_tot:
+# ================================================================ 1 – TOTAL ACQUIRING
+if PAGE == PAGES[0]:
     st.caption("Total = Card MIS (PF + DM) + QRPH posted (separate data sources, simple sum). "
-               "MDR / interchange are card-only and shown in the card tabs.")
+               "MDR / interchange are card-only and shown in the card sections.")
     parts_a = {k: v for k, v in {"Card (PF + DM)": card_a, "QRPH": qr_a}.items() if v is not None}
     parts_rr = {k: rr_series(v, (month_factor if k.startswith("Card") else qr_factor)) for k, v in parts_a.items()}
-
     both = None
     for name, s in parts_a.items():
         s2 = s.rename(columns={"VOLUME": f"V_{name}", "TXN_COUNT": f"N_{name}", "_F": f"F_{name}"})
@@ -947,7 +959,6 @@ with tab_tot:
     elif any(gaps.values()):
         st.warning("Month coverage differs – " + "; ".join(f"no {n} for {g}" for n, g in gaps.items() if g)
                    + ". YTD totals needing those months show '-'.")
-
     tot = pd.DataFrame({"YEAR_MONTH": both.YEAR_MONTH})
     tot["VOLUME"] = sum(both[f"V_{n}"] for n in parts_a)
     tot["TXN_COUNT"] = sum(both[f"N_{n}"] for n in parts_a)
@@ -956,7 +967,6 @@ with tab_tot:
     tot = tot.dropna(subset=["VOLUME"])
     tot["_F"] = (tot.VOLUME_RR / tot.VOLUME).where(lambda x: (x - 1).abs() > 1e-9, 1.0)
     tot_rr = tot[["YEAR_MONTH"]].assign(VOLUME=tot.VOLUME_RR, TXN_COUNT=tot.TXN_COUNT_RR)
-
     any_rr = cur_m in {m for m, f in zip(tot.YEAR_MONTH, tot._F) if f != 1}
     res = {"Total (Card + QRPH)": series_metrics(tot_rr)}
     res.update({n: series_metrics(s) for n, s in parts_rr.items()})
@@ -966,7 +976,6 @@ with tab_tot:
         series_kpis(r, n, rr=is_rr)
     st.subheader("Comparison table – current vs prev month vs LY, YTD, FY outlook")
     series_table(res)
-
     tot = add_period_cols(tot)
     tf = year_filter(tot, "yr_tot_line")
     c1, c2 = st.columns(2)
@@ -974,7 +983,6 @@ with tab_tot:
                             order=ORDER_M, y_rr="VOLUME_RR"), width="stretch")
     c2.plotly_chart(line_rr(tf, "MONTH", "VOLUME", "Total Acquiring – Cumulative YTD Volume", color="YEAR",
                             order=ORDER_M, y_rr="VOLUME_RR", cum=True), width="stretch")
-
     long = pd.concat([add_period_cols(s.assign(SOURCE=n)) for n, s in parts_a.items()])
     long = long[long.YEAR_MONTH <= cur_m]
     rr_months = set(long.loc[long._F != 1, "YEAR_MONTH"])
@@ -994,10 +1002,9 @@ with tab_tot:
                              aggfunc="sum")
         sh = []
         for meas, a, r in [("Volume share", "VOLUME", "V_RR"), ("Txn share", "TXN_COUNT", "N_RR")]:
-            sh.append(pd.DataFrame({
-                "YEAR_MONTH": p.index, "Measure": meas,
-                "SHARE": (p[(a, "QRPH")] / p[a].sum(axis=1)).values,
-                "SHARE_RR": (p[(r, "QRPH")] / p[r].sum(axis=1)).values}))
+            sh.append(pd.DataFrame({"YEAR_MONTH": p.index, "Measure": meas,
+                                    "SHARE": (p[(a, "QRPH")] / p[a].sum(axis=1)).values,
+                                    "SHARE_RR": (p[(r, "QRPH")] / p[r].sum(axis=1)).values}))
         sh = pd.concat(sh)
         sh["_F"] = sh.YEAR_MONTH.isin(rr_months).map({True: 2.0, False: 1.0})
         sh["LABEL"] = sh.YEAR_MONTH.where(sh._F == 1, sh.YEAR_MONTH + " (RR)")
@@ -1008,483 +1015,295 @@ with tab_tot:
         c4.plotly_chart(pie(mix, "VOLUME", f"YTD {CY} Volume Mix (incl. run-rated {MON[END_MM]})", names="SRC")
                         .update_traces(marker=dict(colors=[SRC_COLORS[n] for n in parts_rr])), width="stretch")
 
-# ================================================================ TAB 2 – CARD YoY & YTD
-with tab_yoy:
-    if need_card():
-        seg4 = st.radio("Segment", ["All", "Direct Merchant", "Payment Facilitator"], horizontal=True, key="yoy_seg")
-        d4 = df if seg4 == "All" else df[df.PF_DM_TAG == seg4]
-        st.caption(f"YTD {CY} = {ytd_lbl} {CY} (latest month run-rated) vs {ytd_lbl} {LY} actual. "
-                   f"FY outlook = YTD ÷ {END_MM} × 12.")
-        st.subheader(f"YTD {ytd_lbl}: {CY} vs {LY}")
-        ytd_kpi_block(d4, "Total")
-        m_all = trend_actual(d4)
-        m = year_filter(m_all, "yr_tab4")
+# ================================================================ 2 – CARD YoY & YTD
+if PAGE == PAGES[1] and need_card():
+    seg4 = st.radio("Segment", ["All", "Direct Merchant", "Payment Facilitator"], horizontal=True, key="yoy_seg")
+    d4 = df if seg4 == "All" else df[df.PF_DM_TAG == seg4]
+    st.caption(f"YTD {CY} = {ytd_lbl} {CY} (latest month run-rated) vs {ytd_lbl} {LY} actual. "
+               f"FY outlook = YTD ÷ {END_MM} × 12.")
+    st.subheader(f"YTD {ytd_lbl}: {CY} vs {LY}")
+    ytd_kpi_block(d4, "Total")
+    m_all = trend_actual(d4)
+    m = year_filter(m_all, "yr_tab4")
+    c1, c2 = st.columns(2)
+    c1.plotly_chart(line_rr(m, "MONTH", "VOLUME", "Monthly Volume by Year", color="YEAR", order=ORDER_M), width="stretch")
+    c2.plotly_chart(line_rr(m, "MONTH", "VOLUME", "Cumulative YTD Volume by Year", color="YEAR", order=ORDER_M, cum=True),
+                    width="stretch")
+    c3, c4 = st.columns(2)
+    c3.plotly_chart(yoy_bar(m_all, f"Monthly Volume YoY % ({CY} vs {LY})"), width="stretch")
+    c4.plotly_chart(rate_line(m, "MONTH", "WEIGHTED_MDR", "Weighted MDR by Year (latest month = MTD; not run-rated)",
+                              color="YEAR", order=ORDER_M), width="stretch")
+    st.subheader("YTD YoY by Segment")
+    show_ytd(ytd_compare(df, "PF_DM_TAG"), "PF_DM_TAG")
+    st.subheader(f"YTD YoY by Category – {seg4}")
+    show_ytd(ytd_compare(d4, "INDUSTRY").sort_values("VOLUME", ascending=False), "INDUSTRY")
+    st.subheader(f"YTD YoY by Merchant – {seg4}")
+    mer4 = ytd_compare(d4, "PF_DM_NAME")
+    mer4.loc[mer4.VOLUME_LY.fillna(0) < MIN_LY_BASE, "VOLUME_YoY%"] = float("nan")
+    mer4["VOL_CHG"] = mer4.VOLUME.fillna(0) - mer4.VOLUME_LY.fillna(0)
+    movers = pd.concat([mer4.nlargest(10, "VOL_CHG"), mer4.nsmallest(10, "VOL_CHG")]) \
+        .drop_duplicates("PF_DM_NAME").sort_values("VOL_CHG")
+    st.plotly_chart(px.bar(movers, x="VOL_CHG", y="PF_DM_NAME", orientation="h",
+                           color=(movers.VOL_CHG > 0).map({True: "Gainer", False: "Decliner"}),
+                           color_discrete_map={"Gainer": "#2E8B57", "Decliner": "#C0392B"},
+                           title=f"Top 10 Gainers / Decliners – YTD Volume change vs {LY} (₱, YTD incl. run-rated {MON[END_MM]})")
+                    .update_layout(showlegend=False, height=600), width="stretch")
+    st.caption(f"Vol YoY shown as '-' (n.m.) where YTD {LY} volume < ₱{MIN_LY_BASE:,.0f}.")
+    show_ytd(mer4.sort_values("VOLUME", ascending=False), "PF_DM_NAME")
+
+# ================================================================ 3 – PF vs DM
+if PAGE == PAGES[2] and need_card():
+    st.subheader("Total Portfolio (Card)")
+    kpi_row(period_table(df.assign(ALL="Total"), "ALL"))
+    st.subheader("By Segment")
+    seg = period_table(df, "PF_DM_TAG")
+    for tag in seg.PF_DM_TAG.dropna():
+        st.markdown(f"**{tag}**")
+        kpi_row(seg[seg.PF_DM_TAG == tag].reset_index(drop=True))
+    tr = year_filter(trend_actual(df, "PF_DM_TAG"), "yr_tab1", default_last=2).sort_values("YEAR_MONTH")
+    if not tr.empty:
         c1, c2 = st.columns(2)
-        c1.plotly_chart(line_rr(m, "MONTH", "VOLUME", "Monthly Volume by Year", color="YEAR", order=ORDER_M), width="stretch")
-        c2.plotly_chart(line_rr(m, "MONTH", "VOLUME", "Cumulative YTD Volume by Year", color="YEAR", order=ORDER_M, cum=True),
-                        width="stretch")
+        c1.plotly_chart(bar_rr(tr, "LABEL", "VOLUME", "Monthly Volume", color="PF_DM_TAG", cmap=TAG_COLORS), width="stretch")
+        c2.plotly_chart(bar_rr(tr, "LABEL", "TXN_COUNT", "Monthly Transaction Count", color="PF_DM_TAG",
+                               cmap=TAG_COLORS, fmt=fmt_num), width="stretch")
         c3, c4 = st.columns(2)
-        c3.plotly_chart(yoy_bar(m_all, f"Monthly Volume YoY % ({CY} vs {LY})"), width="stretch")
-        c4.plotly_chart(rate_line(m, "MONTH", "WEIGHTED_MDR", "Weighted MDR by Year (latest month = MTD; not run-rated)",
-                                  color="YEAR", order=ORDER_M), width="stretch")
-        st.subheader("YTD YoY by Segment")
-        show_ytd(ytd_compare(df, "PF_DM_TAG"), "PF_DM_TAG")
-        st.subheader(f"YTD YoY by Category – {seg4}")
-        show_ytd(ytd_compare(d4, "INDUSTRY").sort_values("VOLUME", ascending=False), "INDUSTRY")
-        st.subheader(f"YTD YoY by Merchant – {seg4}")
-        mer4 = ytd_compare(d4, "PF_DM_NAME")
-        mer4.loc[mer4.VOLUME_LY.fillna(0) < MIN_LY_BASE, "VOLUME_YoY%"] = float("nan")
-        mer4["VOL_CHG"] = mer4.VOLUME.fillna(0) - mer4.VOLUME_LY.fillna(0)
-        movers = pd.concat([mer4.nlargest(10, "VOL_CHG"), mer4.nsmallest(10, "VOL_CHG")]) \
-            .drop_duplicates("PF_DM_NAME").sort_values("VOL_CHG")
-        st.plotly_chart(px.bar(movers, x="VOL_CHG", y="PF_DM_NAME", orientation="h",
-                               color=(movers.VOL_CHG > 0).map({True: "Gainer", False: "Decliner"}),
-                               color_discrete_map={"Gainer": "#2E8B57", "Decliner": "#C0392B"},
-                               title=f"Top 10 Gainers / Decliners – YTD Volume change vs {LY} (₱, YTD incl. run-rated {MON[END_MM]})")
-                        .update_layout(showlegend=False, height=600), width="stretch")
-        st.caption(f"Vol YoY shown as '-' (n.m.) where YTD {LY} volume < ₱{MIN_LY_BASE:,.0f}.")
-        show_ytd(mer4.sort_values("VOLUME", ascending=False), "PF_DM_NAME")
+        c3.plotly_chart(rate_line(tr, "LABEL", "WEIGHTED_MDR", "Weighted MDR (not run-rated)",
+                                  color="PF_DM_TAG", cmap=TAG_COLORS), width="stretch")
+        c4.plotly_chart(rate_line(tr, "LABEL", "WEIGHTED_IC", "Weighted Interchange (not run-rated)",
+                                  color="PF_DM_TAG", cmap=TAG_COLORS), width="stretch")
+    show_table(seg, "PF_DM_TAG")
 
-# ================================================================ TAB 3 – PF vs DM
-with tab_ovw:
-    if need_card():
-        st.subheader("Total Portfolio (Card)")
-        kpi_row(period_table(df.assign(ALL="Total"), "ALL"))
-        st.subheader("By Segment")
-        seg = period_table(df, "PF_DM_TAG")
-        for tag in seg.PF_DM_TAG.dropna():
-            st.markdown(f"**{tag}**")
-            kpi_row(seg[seg.PF_DM_TAG == tag].reset_index(drop=True))
-        tr = year_filter(trend_actual(df, "PF_DM_TAG"), "yr_tab1", default_last=2).sort_values("YEAR_MONTH")
-        if not tr.empty:
-            c1, c2 = st.columns(2)
-            c1.plotly_chart(bar_rr(tr, "LABEL", "VOLUME", "Monthly Volume", color="PF_DM_TAG", cmap=TAG_COLORS), width="stretch")
-            c2.plotly_chart(bar_rr(tr, "LABEL", "TXN_COUNT", "Monthly Transaction Count", color="PF_DM_TAG",
-                                   cmap=TAG_COLORS, fmt=fmt_num), width="stretch")
-            c3, c4 = st.columns(2)
-            c3.plotly_chart(rate_line(tr, "LABEL", "WEIGHTED_MDR", "Weighted MDR (not run-rated)",
-                                      color="PF_DM_TAG", cmap=TAG_COLORS), width="stretch")
-            c4.plotly_chart(rate_line(tr, "LABEL", "WEIGHTED_IC", "Weighted Interchange (not run-rated)",
-                                      color="PF_DM_TAG", cmap=TAG_COLORS), width="stretch")
-        show_table(seg, "PF_DM_TAG")
+# ================================================================ 4 – CATEGORY MIX
+if PAGE == PAGES[3] and need_card():
+    seg_pick = st.radio("Segment", ["All", "Direct Merchant", "Payment Facilitator"], horizontal=True, key="cat_seg")
+    d2 = df if seg_pick == "All" else df[df.PF_DM_TAG == seg_pick]
+    cat = period_table(d2, "INDUSTRY").sort_values("VOLUME", ascending=False)
+    cat["VOL_SHARE"] = cat.VOLUME / cat.VOLUME.sum()
+    cat["VOL_SHARE_PM"] = cat.VOLUME_PM / cat.VOLUME_PM.sum()
+    cat["SHARE_CHG_PP"] = (cat.VOL_SHARE - cat.VOL_SHARE_PM) * 100
+    rr_t = " – run-rate basis (share = MTD share)" if CUR_FACTOR != 1 else ""
+    c1, c2 = st.columns(2)
+    c1.plotly_chart(pie(top_n_others(cat, "VOLUME"), "VOLUME", f"Volume Share – {seg_pick} – {cur_m}{rr_t}"), width="stretch")
+    c2.plotly_chart(pie(top_n_others(cat, "TXN_COUNT"), "TXN_COUNT", f"Txn Count Share – {seg_pick} – {cur_m}{rr_t}"), width="stretch")
+    top = cat.loc[cat.INDUSTRY != OTHERS_LABEL, "INDUSTRY"].head(CAT_TOP_N).tolist()
+    tr2 = year_filter(trend_actual(d2, "INDUSTRY"), "yr_cat", default_last=2)
+    tr2["CAT"] = tr2.INDUSTRY.where(tr2.INDUSTRY.isin(top), OTHERS_LABEL)
+    tr2 = tr2.groupby(["YEAR_MONTH", "LABEL", "CAT", "_F"], as_index=False).VOLUME.sum().sort_values("YEAR_MONTH")
+    c1, c2 = st.columns(2)
+    c1.plotly_chart(bar_rr(tr2, "LABEL", "VOLUME", f"Monthly Volume by Category (Top {CAT_TOP_N} + Others)",
+                           color="CAT"), width="stretch")
+    tr2["SHARE"] = tr2.VOLUME / tr2.groupby("LABEL").VOLUME.transform("sum")
+    c2.plotly_chart(px.bar(tr2, x="LABEL", y="SHARE", color="CAT", category_orders={"CAT": top + [OTHERS_LABEL]},
+                           title="Volume Share Trend ((RR) month share = MTD share)")
+                    .update_yaxes(tickformat=".0%").update_xaxes(type="category"), width="stretch")
+    st.plotly_chart(px.bar(cat.head(15), x="SHARE_CHG_PP", y="INDUSTRY", orientation="h",
+                           title=f"Volume Share Change vs {mom_m} (pp)").update_yaxes(autorange="reversed"), width="stretch")
+    show_table(cat.assign(**{"Vol Share": cat.VOL_SHARE}), ["INDUSTRY", "Vol Share"])
 
-# ================================================================ TAB 4 – CATEGORY MIX
-with tab_cat:
-    if need_card():
-        seg_pick = st.radio("Segment", ["All", "Direct Merchant", "Payment Facilitator"], horizontal=True, key="cat_seg")
-        d2 = df if seg_pick == "All" else df[df.PF_DM_TAG == seg_pick]
-        cat = period_table(d2, "INDUSTRY").sort_values("VOLUME", ascending=False)
-        cat["VOL_SHARE"] = cat.VOLUME / cat.VOLUME.sum()
-        cat["VOL_SHARE_PM"] = cat.VOLUME_PM / cat.VOLUME_PM.sum()
-        cat["SHARE_CHG_PP"] = (cat.VOL_SHARE - cat.VOL_SHARE_PM) * 100
-        rr_t = " – run-rate basis (share = MTD share)" if CUR_FACTOR != 1 else ""
-        c1, c2 = st.columns(2)
-        c1.plotly_chart(pie(top_n_others(cat, "VOLUME"), "VOLUME", f"Volume Share – {seg_pick} – {cur_m}{rr_t}"), width="stretch")
-        c2.plotly_chart(pie(top_n_others(cat, "TXN_COUNT"), "TXN_COUNT", f"Txn Count Share – {seg_pick} – {cur_m}{rr_t}"), width="stretch")
-        top = cat.loc[cat.INDUSTRY != OTHERS_LABEL, "INDUSTRY"].head(CAT_TOP_N).tolist()
-        tr2 = year_filter(trend_actual(d2, "INDUSTRY"), "yr_cat", default_last=2)
-        tr2["CAT"] = tr2.INDUSTRY.where(tr2.INDUSTRY.isin(top), OTHERS_LABEL)
-        tr2 = tr2.groupby(["YEAR_MONTH", "LABEL", "CAT", "_F"], as_index=False).VOLUME.sum().sort_values("YEAR_MONTH")
-        c1, c2 = st.columns(2)
-        c1.plotly_chart(bar_rr(tr2, "LABEL", "VOLUME", f"Monthly Volume by Category (Top {CAT_TOP_N} + Others)",
-                               color="CAT"), width="stretch")
-        tr2["SHARE"] = tr2.VOLUME / tr2.groupby("LABEL").VOLUME.transform("sum")
-        c2.plotly_chart(px.bar(tr2, x="LABEL", y="SHARE", color="CAT", category_orders={"CAT": top + [OTHERS_LABEL]},
-                               title="Volume Share Trend ((RR) month share = MTD share)")
-                        .update_yaxes(tickformat=".0%").update_xaxes(type="category"), width="stretch")
-        st.plotly_chart(px.bar(cat.head(15), x="SHARE_CHG_PP", y="INDUSTRY", orientation="h",
-                               title=f"Volume Share Change vs {mom_m} (pp)").update_yaxes(autorange="reversed"), width="stretch")
-        show_table(cat.assign(**{"Vol Share": cat.VOL_SHARE}), ["INDUSTRY", "Vol Share"])
+# ================================================================ 5 – MERCHANT LEVEL
+if PAGE == PAGES[4] and need_card():
+    seg3 = st.radio("Segment", ["Payment Facilitator", "Direct Merchant"], horizontal=True, key="m_seg")
+    d3 = df[df.PF_DM_TAG == seg3]
+    mer = period_table(d3, "PF_DM_NAME").sort_values("VOLUME", ascending=False)
+    mer["VOL_SHARE"] = mer.VOLUME / mer.VOLUME.sum()
+    top_n = st.slider("Top N merchants", 5, 30, 10, key="topn_mer")
+    topm = mer.head(top_n)
+    c1, c2 = st.columns(2)
+    c1.plotly_chart(bar_rr(rr_snapshot(topm, "PF_DM_NAME", "VOLUME"), "PF_DM_NAME", "VOLUME",
+                           f"Top {top_n} {seg3}s – {cur_m} volume", horizontal=True,
+                           height=max(400, 35 * top_n)), width="stretch")
+    mv = topm.melt(id_vars="PF_DM_NAME", value_vars=["VOLUME_MoM%", "VOLUME_YoY%"], var_name="Comparison", value_name="Growth")
+    c2.plotly_chart(px.bar(mv, x="Growth", y="PF_DM_NAME", color="Comparison", barmode="group", orientation="h",
+                           title=f"Volume Growth – MoM vs YoY{' (on run-rate)' if CUR_FACTOR != 1 else ''}")
+                    .update_xaxes(tickformat=".0%").update_yaxes(autorange="reversed")
+                    .update_layout(height=max(400, 35 * top_n)), width="stretch")
+    show_table(mer.assign(**{"Vol Share": mer.VOL_SHARE}), ["PF_DM_NAME", "Vol Share"])
 
-# ================================================================ TAB 5 – MERCHANT LEVEL
-with tab_mer:
-    if need_card():
-        seg3 = st.radio("Segment", ["Payment Facilitator", "Direct Merchant"], horizontal=True, key="m_seg")
-        d3 = df[df.PF_DM_TAG == seg3]
-        mer = period_table(d3, "PF_DM_NAME").sort_values("VOLUME", ascending=False)
-        mer["VOL_SHARE"] = mer.VOLUME / mer.VOLUME.sum()
-        top_n = st.slider("Top N merchants", 5, 30, 10, key="topn_mer")
-        topm = mer.head(top_n)
-        c1, c2 = st.columns(2)
-        c1.plotly_chart(bar_rr(rr_snapshot(topm, "PF_DM_NAME", "VOLUME"), "PF_DM_NAME", "VOLUME",
-                               f"Top {top_n} {seg3}s – {cur_m} volume", horizontal=True,
-                               height=max(400, 35 * top_n)), width="stretch")
-        mv = topm.melt(id_vars="PF_DM_NAME", value_vars=["VOLUME_MoM%", "VOLUME_YoY%"], var_name="Comparison", value_name="Growth")
-        c2.plotly_chart(px.bar(mv, x="Growth", y="PF_DM_NAME", color="Comparison", barmode="group", orientation="h",
-                               title=f"Volume Growth – MoM vs YoY{' (on run-rate)' if CUR_FACTOR != 1 else ''}")
-                        .update_xaxes(tickformat=".0%").update_yaxes(autorange="reversed")
-                        .update_layout(height=max(400, 35 * top_n)), width="stretch")
-        show_table(mer.assign(**{"Vol Share": mer.VOL_SHARE}), ["PF_DM_NAME", "Vol Share"])
+    if seg3 == "Payment Facilitator":
+        st.divider()
+        if st.toggle("Show sub-merchants under each Payment Facilitator (MERCHANT_NAME_ORIG)", value=False,
+                     key="sub_toggle"):
+            pf_list = mer.PF_DM_NAME.dropna().tolist()
+            pfs = st.multiselect("Payment Facilitators to expand", pf_list, default=pf_list[:3], key="sub_pfs")
+            ds = d3[d3.PF_DM_NAME.isin(pfs)]
+            if ds.empty:
+                st.info("Select at least one Payment Facilitator.")
+            else:
+                sub = period_table(ds, ["PF_DM_NAME", SUB_COL]).sort_values("VOLUME", ascending=False)
+                sub["Share of PF"] = sub.VOLUME / sub.groupby("PF_DM_NAME").VOLUME.transform("sum")
+                sub_n = st.slider("Top N sub-merchants per PF", 3, 30, 10, key="sub_n")
+                subt = sub.groupby("PF_DM_NAME", group_keys=False).head(sub_n)
+                tm = subt[subt.VOLUME > 0]
+                st.plotly_chart(px.treemap(tm, path=[px.Constant("Selected PFs"), "PF_DM_NAME", SUB_COL],
+                                           values="VOLUME",
+                                           title=f"PF → Sub-merchant volume ({cur_m}{' run-rate' if CUR_FACTOR != 1 else ''}) – click a PF to zoom in")
+                                .update_traces(texttemplate="%{label}<br>%{percentParent:.1%}")
+                                .update_layout(height=550, margin=dict(t=50, l=5, r=5, b=5)), width="stretch")
+                sb = subt.head(30)
+                st.plotly_chart(bar_rr(rr_snapshot(sb, SUB_COL, "VOLUME"), SUB_COL, "VOLUME",
+                                       f"Top sub-merchants – {cur_m} volume (colour = PF)", color="PF_DM_NAME",
+                                       horizontal=True, height=max(450, 28 * len(sb))), width="stretch")
+                show_table(subt.assign(**{"Vol Share": subt["Share of PF"]}), ["PF_DM_NAME", SUB_COL, "Vol Share"])
+                st.caption("'Vol Share' here = share of the sub-merchant within its PF.")
 
-        if seg3 == "Payment Facilitator":
-            st.divider()
-            show_sub = st.toggle("Show sub-merchants under each Payment Facilitator (MERCHANT_NAME_ORIG)",
-                                 value=False, key="sub_toggle")
-            if show_sub:
-                pf_list = mer.PF_DM_NAME.dropna().tolist()
-                pfs = st.multiselect("Payment Facilitators to expand", pf_list, default=pf_list[:3], key="sub_pfs")
-                ds = d3[d3.PF_DM_NAME.isin(pfs)]
-                if ds.empty:
-                    st.info("Select at least one Payment Facilitator.")
-                else:
-                    sub = period_table(ds, ["PF_DM_NAME", SUB_COL]).sort_values("VOLUME", ascending=False)
-                    sub["Share of PF"] = sub.VOLUME / sub.groupby("PF_DM_NAME").VOLUME.transform("sum")
-                    sub_n = st.slider("Top N sub-merchants per PF", 3, 30, 10, key="sub_n")
-                    subt = sub.groupby("PF_DM_NAME", group_keys=False).head(sub_n)
-                    tm = subt[subt.VOLUME > 0]
-                    st.plotly_chart(px.treemap(tm, path=[px.Constant("Selected PFs"), "PF_DM_NAME", SUB_COL],
-                                               values="VOLUME",
-                                               title=f"PF → Sub-merchant volume ({cur_m}{' run-rate' if CUR_FACTOR != 1 else ''}) – click a PF to zoom in")
-                                    .update_traces(texttemplate="%{label}<br>%{percentParent:.1%}")
-                                    .update_layout(height=550, margin=dict(t=50, l=5, r=5, b=5)), width="stretch")
-                    sb = subt.head(30)
-                    st.plotly_chart(bar_rr(rr_snapshot(sb, SUB_COL, "VOLUME"), SUB_COL, "VOLUME",
-                                           f"Top sub-merchants – {cur_m} volume (colour = PF)", color="PF_DM_NAME",
-                                           horizontal=True, height=max(450, 28 * len(sb))), width="stretch")
-                    show_table(subt.assign(**{"Vol Share": subt["Share of PF"]}), ["PF_DM_NAME", SUB_COL, "Vol Share"])
-                    st.caption("'Vol Share' here = share of the sub-merchant within its PF.")
+    st.divider()
+    st.subheader("Merchant drill-down")
+    cA, cB = st.columns(2)
+    pick = cA.selectbox(f"Drill down: {seg3}", mer.PF_DM_NAME.dropna().tolist(), key="drill_pf")
+    dd = d3[d3.PF_DM_NAME == pick]
+    sub_pick = "All"
+    if seg3 == "Payment Facilitator":
+        subs = summarize(dd[dd.YEAR_MONTH == cur_m], SUB_COL).sort_values("VOLUME", ascending=False)[SUB_COL].tolist()
+        subs += sorted(set(dd[SUB_COL]) - set(subs))
+        sub_pick = cB.selectbox(f"Sub-merchant under {pick}", ["All"] + subs, key="drill_sub")
+        if sub_pick != "All":
+            dd = dd[dd[SUB_COL] == sub_pick]
+    label = pick if sub_pick == "All" else f"{pick} › {sub_pick}"
+    trd_all = trend_actual(dd)
+    st.markdown(f"#### ① YoY & YTD – {label}")
+    st.caption(f"YTD {ytd_lbl} {CY}{' (incl. run-rated ' + MON[END_MM] + ')' if CUR_FACTOR != 1 else ''} "
+               f"vs YTD {ytd_lbl} {LY} actual · FY outlook = YTD ÷ {END_MM} × 12 vs FY {LY} actual")
+    ytd_kpi_block(dd, label)
+    trd_y = year_filter(trd_all, "yr_drill")
+    c1, c2 = st.columns(2)
+    c1.plotly_chart(line_rr(trd_y, "MONTH", "VOLUME", f"{label} – Monthly Volume by Year", color="YEAR",
+                            order=ORDER_M), width="stretch")
+    c2.plotly_chart(line_rr(trd_y, "MONTH", "VOLUME", f"{label} – Cumulative YTD Volume by Year", color="YEAR",
+                            order=ORDER_M, cum=True), width="stretch")
+    c3, c4 = st.columns(2)
+    c3.plotly_chart(yoy_bar(trd_all, f"{label} – Monthly Volume YoY % ({CY} vs {LY})"), width="stretch")
+    c4.plotly_chart(rate_line(trd_y, "MONTH", "WEIGHTED_MDR", f"{label} – Weighted MDR by Year (not run-rated)",
+                              color="YEAR", order=ORDER_M), width="stretch")
+    if seg3 == "Payment Facilitator" and sub_pick == "All":
+        st.markdown(f"**YTD YoY – sub-merchants under {pick}**")
+        sy = ytd_compare(dd, SUB_COL)
+        sy.loc[sy.VOLUME_LY.fillna(0) < MIN_LY_BASE, "VOLUME_YoY%"] = float("nan")
+        show_ytd(sy.sort_values("VOLUME", ascending=False), SUB_COL)
+    st.markdown(f"#### ② Month on month – {label}: {cur_m}{RR_TAG} vs {mom_m}")
+    kpi_row(period_table(dd.assign(ALL=label), "ALL"))
+    trd = trd_all.sort_values("YEAR_MONTH")
+    trd = trd[trd.YEAR_MONTH >= prev_month(cur_m, 12)]
+    c1, c2 = st.columns(2)
+    c1.plotly_chart(bar_rr(trd, "LABEL", "VOLUME", f"{label} – Monthly Volume (last 13 months)"), width="stretch")
+    c2.plotly_chart(rate_line(trd, "LABEL", ["WEIGHTED_MDR", "WEIGHTED_IC"],
+                              f"{label} – Weighted MDR vs Interchange (not run-rated)"), width="stretch")
+    if seg3 == "Payment Facilitator" and sub_pick == "All":
+        st.markdown(f"**MoM – sub-merchants under {pick}**")
+        show_table(period_table(dd, SUB_COL).sort_values("VOLUME", ascending=False), SUB_COL)
+
+# ================================================================ 6 – PF LEVEL (MID → SUB-MERCHANT)
+if PAGE == PAGES[5] and need_card():
+    dpf = df[df.PF_DM_TAG == "Payment Facilitator"]
+    if dpf.empty:
+        st.info("No Payment Facilitator rows in the Card MIS.")
+    else:
+        st.caption(f"Hierarchy: **PF** (PF_DM_NAME) → **MID** (CARD_ACCEPTOR_ID) → **Sub-merchant** "
+                   f"(MERCHANT_NAME_ORIG). YTD {ytd_lbl} {CY}{' incl. run-rated ' + MON[END_MM] if CUR_FACTOR != 1 else ''} "
+                   f"vs {ytd_lbl} {LY} · month {cur_m}{RR_TAG} vs {mom_m} (MoM) and {yoy_m} (YoY). "
+                   f"YoY shown as '-' where the LY base is too small.")
+        st.subheader("All Payment Facilitators – YTD, YoY, MoM")
+        allpf = full_compare(dpf, "PF_DM_NAME").sort_values("YTD__VOLUME", ascending=False)
+        allpf["YTD Share"] = allpf.YTD__VOLUME / allpf.YTD__VOLUME.sum()
+        show_full(allpf, "PF_DM_NAME", extra=["YTD Share"], height=380)
 
         st.divider()
-        st.subheader("Merchant drill-down")
-        cA, cB = st.columns(2)
-        pick = cA.selectbox(f"Drill down: {seg3}", mer.PF_DM_NAME.dropna().tolist(), key="drill_pf")
-        dd = d3[d3.PF_DM_NAME == pick]
-        sub_pick = "All"
-        if seg3 == "Payment Facilitator":
-            subs = summarize(dd[dd.YEAR_MONTH == cur_m], SUB_COL).sort_values("VOLUME", ascending=False)[SUB_COL].tolist()
-            subs += sorted(set(dd[SUB_COL]) - set(subs))
-            sub_pick = cB.selectbox(f"Sub-merchant under {pick}", ["All"] + subs, key="drill_sub")
-            if sub_pick != "All":
-                dd = dd[dd[SUB_COL] == sub_pick]
-        label = pick if sub_pick == "All" else f"{pick} › {sub_pick}"
-        trd_all = trend_actual(dd)
-        st.markdown(f"#### ① YoY & YTD – {label}")
-        st.caption(f"YTD {ytd_lbl} {CY}{' (incl. run-rated ' + MON[END_MM] + ')' if CUR_FACTOR != 1 else ''} "
-                   f"vs YTD {ytd_lbl} {LY} actual · FY outlook = YTD ÷ {END_MM} × 12 vs FY {LY} actual")
-        ytd_kpi_block(dd, label)
-        trd_y = year_filter(trd_all, "yr_drill")
+        pf = st.selectbox("Select Payment Facilitator", allpf.PF_DM_NAME.dropna().tolist(), key="pf_pick")
+        dp = dpf[dpf.PF_DM_NAME == pf]
+        st.markdown(f"#### ① {pf} – YoY & YTD")
+        ytd_kpi_block(dp, pf)
+        cur_rows, pm_rows, ly_rows = dp[dp.YEAR_MONTH == cur_m], dp[dp.YEAR_MONTH == mom_m], dp[dp.YEAR_MONTH == yoy_m]
+        c = st.columns(4)
+        n_mid, n_sub = cur_rows[MID_COL].nunique(), cur_rows[SUB_COL].nunique()
+        c[0].metric(f"Active MIDs ({cur_m})", f"{n_mid:,}",
+                    f"{n_mid - pm_rows[MID_COL].nunique():+,} MoM | {n_mid - ly_rows[MID_COL].nunique():+,} YoY")
+        c[1].metric(f"Active sub-merchants ({cur_m})", f"{n_sub:,}",
+                    f"{n_sub - pm_rows[SUB_COL].nunique():+,} MoM | {n_sub - ly_rows[SUB_COL].nunique():+,} YoY")
+        new_subs = set(cur_rows[SUB_COL]) - set(dp[dp.YEAR_MONTH < cur_m][SUB_COL])
+        c[2].metric(f"New sub-merchants in {cur_m}", f"{len(new_subs):,}", "first-ever transaction month",
+                    delta_color="off")
+        c[3].metric(f"Sub-merchants transacting YTD {CY}", f"{ytd_slice(dp, CY, END_MM)[SUB_COL].nunique():,}",
+                    f"LY YTD {ytd_slice(dp, LY, END_MM)[SUB_COL].nunique():,}", delta_color="off")
+        tp_all = trend_actual(dp)
+        tp = year_filter(tp_all, "yr_pf")
         c1, c2 = st.columns(2)
-        c1.plotly_chart(line_rr(trd_y, "MONTH", "VOLUME", f"{label} – Monthly Volume by Year", color="YEAR",
+        c1.plotly_chart(line_rr(tp, "MONTH", "VOLUME", f"{pf} – Monthly Volume by Year", color="YEAR",
                                 order=ORDER_M), width="stretch")
-        c2.plotly_chart(line_rr(trd_y, "MONTH", "VOLUME", f"{label} – Cumulative YTD Volume by Year", color="YEAR",
+        c2.plotly_chart(line_rr(tp, "MONTH", "VOLUME", f"{pf} – Cumulative YTD Volume", color="YEAR",
                                 order=ORDER_M, cum=True), width="stretch")
         c3, c4 = st.columns(2)
-        c3.plotly_chart(yoy_bar(trd_all, f"{label} – Monthly Volume YoY % ({CY} vs {LY})"), width="stretch")
-        c4.plotly_chart(rate_line(trd_y, "MONTH", "WEIGHTED_MDR", f"{label} – Weighted MDR by Year (not run-rated)",
+        c3.plotly_chart(yoy_bar(tp_all, f"{pf} – Monthly Volume YoY % ({CY} vs {LY})"), width="stretch")
+        c4.plotly_chart(rate_line(tp, "MONTH", "WEIGHTED_MDR", f"{pf} – Weighted MDR by Year (not run-rated)",
                                   color="YEAR", order=ORDER_M), width="stretch")
-        if seg3 == "Payment Facilitator" and sub_pick == "All":
-            st.markdown(f"**YTD YoY – sub-merchants under {pick}**")
-            sy = ytd_compare(dd, SUB_COL)
-            sy.loc[sy.VOLUME_LY.fillna(0) < MIN_LY_BASE, "VOLUME_YoY%"] = float("nan")
-            show_ytd(sy.sort_values("VOLUME", ascending=False), SUB_COL)
-        st.markdown(f"#### ② Month on month – {label}: {cur_m}{RR_TAG} vs {mom_m}")
-        kpi_row(period_table(dd.assign(ALL=label), "ALL"))
-        trd = trd_all.sort_values("YEAR_MONTH")
-        trd = trd[trd.YEAR_MONTH >= prev_month(cur_m, 12)]
+        st.markdown(f"#### ② {pf} – Month on month: {cur_m}{RR_TAG} vs {mom_m}")
+        kpi_row(period_table(dp.assign(ALL=pf), "ALL"))
+
+        st.markdown(f"#### ③ MIDs under {pf}")
+        mids = full_compare(dp, MID_COL).sort_values("YTD__VOLUME", ascending=False)
+        mids["YTD Share of PF"] = mids.YTD__VOLUME / mids.YTD__VOLUME.sum()
+        ind = (dp.groupby([MID_COL, "INDUSTRY"]).TOTAL_VOLUME.sum().reset_index()
+                 .sort_values("TOTAL_VOLUME", ascending=False).drop_duplicates(MID_COL)
+                 .rename(columns={"INDUSTRY": "Main industry"})[[MID_COL, "Main industry"]])
+        mids = mids.merge(ind, on=MID_COL, how="left")
+        show_full(mids, [MID_COL, "Main industry"], extra=["YTD Share of PF"], height=320)
+        tm = trend_actual(dp, MID_COL)
+        top_mids = mids[MID_COL].head(MID_TOP_N).tolist()
+        tm["MID_GRP"] = tm[MID_COL].where(tm[MID_COL].isin(top_mids), "Other MIDs")
+        tm = year_filter(tm, "yr_pf_mid", default_last=2, label="Years shown in MID chart")
+        tm = tm.groupby(["YEAR_MONTH", "LABEL", "MID_GRP", "_F"], as_index=False).VOLUME.sum().sort_values("YEAR_MONTH")
         c1, c2 = st.columns(2)
-        c1.plotly_chart(bar_rr(trd, "LABEL", "VOLUME", f"{label} – Monthly Volume (last 13 months)"), width="stretch")
-        c2.plotly_chart(rate_line(trd, "LABEL", ["WEIGHTED_MDR", "WEIGHTED_IC"],
-                                  f"{label} – Weighted MDR vs Interchange (not run-rated)"), width="stretch")
-        if seg3 == "Payment Facilitator" and sub_pick == "All":
-            st.markdown(f"**MoM – sub-merchants under {pick}**")
-            show_table(period_table(dd, SUB_COL).sort_values("VOLUME", ascending=False), SUB_COL)
+        c1.plotly_chart(bar_rr(tm, "LABEL", "VOLUME", f"{pf} – Monthly Volume by MID (top {MID_TOP_N})",
+                               color="MID_GRP"), width="stretch")
+        c2.plotly_chart(ytd_vs_ly_bar(mids, MID_COL, f"{pf} – YTD {CY} vs YTD {LY} by MID"), width="stretch")
 
-# ================================================================ TAB 6 – PF LEVEL (MID → SUB-MERCHANT)
-with tab_pf:
-    if need_card():
-        dpf = df[df.PF_DM_TAG == "Payment Facilitator"]
-        if dpf.empty:
-            st.info("No Payment Facilitator rows in the Card MIS.")
-        else:
-            st.caption(f"Hierarchy: **PF** (PF_DM_NAME) → **MID** (CARD_ACCEPTOR_ID) → **Sub-merchant** "
-                       f"(MERCHANT_NAME_ORIG). YTD {ytd_lbl} {CY}{' incl. run-rated ' + MON[END_MM] if CUR_FACTOR != 1 else ''} "
-                       f"vs {ytd_lbl} {LY} · month {cur_m}{RR_TAG} vs {mom_m} (MoM) and {yoy_m} (YoY). "
-                       f"YoY shown as '-' where the LY base is too small.")
-            st.subheader("All Payment Facilitators – YTD, YoY, MoM")
-            allpf = full_compare(dpf, "PF_DM_NAME").sort_values("YTD__VOLUME", ascending=False)
-            allpf["YTD Share"] = allpf.YTD__VOLUME / allpf.YTD__VOLUME.sum()
-            show_full(allpf, "PF_DM_NAME", extra=["YTD Share"], height=380)
+        st.markdown("#### ④ Sub-merchants under each MID")
+        cA, cB = st.columns([2, 1])
+        mid_idx = mids.set_index(MID_COL)
+        mid_opts = ["All MIDs"] + mids[MID_COL].tolist()
 
-            st.divider()
-            pf = st.selectbox("Select Payment Facilitator", allpf.PF_DM_NAME.dropna().tolist(), key="pf_pick")
-            dp = dpf[dpf.PF_DM_NAME == pf]
-            st.markdown(f"#### ① {pf} – YoY & YTD")
-            ytd_kpi_block(dp, pf)
-            cur_rows, pm_rows, ly_rows = dp[dp.YEAR_MONTH == cur_m], dp[dp.YEAR_MONTH == mom_m], dp[dp.YEAR_MONTH == yoy_m]
-            c = st.columns(4)
-            n_mid, n_sub = cur_rows[MID_COL].nunique(), cur_rows[SUB_COL].nunique()
-            c[0].metric(f"Active MIDs ({cur_m})", f"{n_mid:,}",
-                        f"{n_mid - pm_rows[MID_COL].nunique():+,} MoM | {n_mid - ly_rows[MID_COL].nunique():+,} YoY")
-            c[1].metric(f"Active sub-merchants ({cur_m})", f"{n_sub:,}",
-                        f"{n_sub - pm_rows[SUB_COL].nunique():+,} MoM | {n_sub - ly_rows[SUB_COL].nunique():+,} YoY")
-            new_subs = set(cur_rows[SUB_COL]) - set(dp[dp.YEAR_MONTH < cur_m][SUB_COL])
-            c[2].metric(f"New sub-merchants in {cur_m}", f"{len(new_subs):,}", "first-ever transaction month",
-                        delta_color="off")
-            c[3].metric(f"Sub-merchants transacting YTD {CY}", f"{ytd_slice(dp, CY, END_MM)[SUB_COL].nunique():,}",
-                        f"LY YTD {ytd_slice(dp, LY, END_MM)[SUB_COL].nunique():,}", delta_color="off")
-            tp_all = trend_actual(dp)
-            tp = year_filter(tp_all, "yr_pf")
-            c1, c2 = st.columns(2)
-            c1.plotly_chart(line_rr(tp, "MONTH", "VOLUME", f"{pf} – Monthly Volume by Year", color="YEAR",
-                                    order=ORDER_M), width="stretch")
-            c2.plotly_chart(line_rr(tp, "MONTH", "VOLUME", f"{pf} – Cumulative YTD Volume", color="YEAR",
-                                    order=ORDER_M, cum=True), width="stretch")
-            c3, c4 = st.columns(2)
-            c3.plotly_chart(yoy_bar(tp_all, f"{pf} – Monthly Volume YoY % ({CY} vs {LY})"), width="stretch")
-            c4.plotly_chart(rate_line(tp, "MONTH", "WEIGHTED_MDR", f"{pf} – Weighted MDR by Year (not run-rated)",
-                                      color="YEAR", order=ORDER_M), width="stretch")
-            st.markdown(f"#### ② {pf} – Month on month: {cur_m}{RR_TAG} vs {mom_m}")
-            kpi_row(period_table(dp.assign(ALL=pf), "ALL"))
+        def _mid_lbl(m):
+            if m == "All MIDs":
+                return m
+            r = mid_idx.loc[m]
+            n = int(r["N_SUB"]) if pd.notna(r["N_SUB"]) else 0
+            return f"{m} · {r['Main industry']} · {n} subs"
 
-            st.markdown(f"#### ③ MIDs under {pf}")
-            mids = full_compare(dp, MID_COL).sort_values("YTD__VOLUME", ascending=False)
-            mids["YTD Share of PF"] = mids.YTD__VOLUME / mids.YTD__VOLUME.sum()
-            ind = (dp.groupby([MID_COL, "INDUSTRY"]).TOTAL_VOLUME.sum().reset_index()
-                     .sort_values("TOTAL_VOLUME", ascending=False).drop_duplicates(MID_COL)
-                     .rename(columns={"INDUSTRY": "Main industry"})[[MID_COL, "Main industry"]])
-            mids = mids.merge(ind, on=MID_COL, how="left")
-            show_full(mids, [MID_COL, "Main industry"], extra=["YTD Share of PF"], height=320)
-            tm = trend_actual(dp, MID_COL)
-            top_mids = mids[MID_COL].head(MID_TOP_N).tolist()
-            tm["MID_GRP"] = tm[MID_COL].where(tm[MID_COL].isin(top_mids), "Other MIDs")
-            tm = year_filter(tm, "yr_pf_mid", default_last=2, label="Years shown in MID chart")
-            tm = tm.groupby(["YEAR_MONTH", "LABEL", "MID_GRP", "_F"], as_index=False).VOLUME.sum().sort_values("YEAR_MONTH")
-            c1, c2 = st.columns(2)
-            c1.plotly_chart(bar_rr(tm, "LABEL", "VOLUME", f"{pf} – Monthly Volume by MID (top {MID_TOP_N})",
-                                   color="MID_GRP"), width="stretch")
-            c2.plotly_chart(ytd_vs_ly_bar(mids, MID_COL, f"{pf} – YTD {CY} vs YTD {LY} by MID"), width="stretch")
+        mid_pick = cA.selectbox("MID", mid_opts, index=0, key="pf_mid_pick", format_func=_mid_lbl)
+        rank_by = cB.radio("Rank sub-merchants by", ["YTD__VOLUME", "VOLUME"], horizontal=True, key="pf_rank",
+                           format_func=lambda x: f"YTD {CY}" if x.startswith("YTD") else f"{cur_m}{RR_TAG}")
+        dm = dp if mid_pick == "All MIDs" else dp[dp[MID_COL] == mid_pick]
+        root = pf if mid_pick == "All MIDs" else f"{pf} – MID {mid_pick} only"
+        fig_t = yoy_treemap(dm, root, f"{root} → MID → Sub-merchant · size = YTD {CY} volume · colour = YTD YoY "
+                                      f"(Σ {CY} ÷ Σ {LY} − 1 at each box; grey = new / n.m.)")
+        if fig_t is not None:
+            st.plotly_chart(fig_t, width="stretch")
+            st.caption("Each box's YoY is calculated from its own summed volumes, so the top box matches the "
+                       f"{pf} YTD card above (when 'All MIDs' is selected). Colour scale: red ≤ −100% · "
+                       "yellow 0% · green ≥ +100%.")
+        subs = full_compare(dm, [MID_COL, SUB_COL]).sort_values(rank_by, ascending=False)
+        subs["Share of MID (YTD)"] = subs.YTD__VOLUME / subs.groupby(MID_COL).YTD__VOLUME.transform("sum")
+        subs = subs.drop(columns=["N_MID", "N_SUB"])
+        top_s = st.slider("Top N sub-merchants", 5, 40, 15, key="pf_sub_n")
+        ts = subs.head(top_s)
+        c1, c2 = st.columns(2)
+        c1.plotly_chart(bar_rr(rr_snapshot(ts, SUB_COL, "VOLUME"), SUB_COL, "VOLUME",
+                               f"Top {top_s} sub-merchants – {cur_m} volume", horizontal=True,
+                               height=max(400, 30 * len(ts))), width="stretch")
+        c2.plotly_chart(ytd_vs_ly_bar(ts.drop_duplicates(SUB_COL), SUB_COL,
+                                      f"Top {top_s} sub-merchants – YTD {CY} vs YTD {LY}", top=top_s), width="stretch")
+        show_full(subs, [MID_COL, SUB_COL], extra=["Share of MID (YTD)"], height=420)
+        sub_pick2 = st.selectbox("Sub-merchant trend", subs[SUB_COL].drop_duplicates().tolist(), key="pf_sub_pick")
+        ds = dm[dm[SUB_COL] == sub_pick2]
+        ytd_kpi_block(ds, sub_pick2)
+        ts_tr = trend_actual(ds).sort_values("YEAR_MONTH")
+        ts_tr = ts_tr[ts_tr.YEAR_MONTH >= prev_month(cur_m, 12)]
+        c1, c2 = st.columns(2)
+        c1.plotly_chart(bar_rr(ts_tr, "LABEL", "VOLUME", f"{sub_pick2} – Monthly Volume (last 13 months)"),
+                        width="stretch")
+        c2.plotly_chart(rate_line(ts_tr, "LABEL", ["WEIGHTED_MDR", "WEIGHTED_IC"],
+                                  f"{sub_pick2} – Weighted MDR vs Interchange (not run-rated)"), width="stretch")
 
-            st.markdown("#### ④ Sub-merchants under each MID")
-            cA, cB = st.columns([2, 1])
-            mid_idx = mids.set_index(MID_COL)
-            mid_opts = ["All MIDs"] + mids[MID_COL].tolist()
-
-            def _mid_lbl(m):
-                if m == "All MIDs":
-                    return m
-                r = mid_idx.loc[m]
-                n = int(r["N_SUB"]) if pd.notna(r["N_SUB"]) else 0
-                return f"{m} · {r['Main industry']} · {n} subs"
-
-            mid_pick = cA.selectbox("MID", mid_opts, index=1 if len(mid_opts) > 1 else 0, key="pf_mid_pick",
-                                    format_func=_mid_lbl)
-            rank_by = cB.radio("Rank sub-merchants by", ["YTD__VOLUME", "VOLUME"], horizontal=True, key="pf_rank",
-                               format_func=lambda x: f"YTD {CY}" if x.startswith("YTD") else f"{cur_m}{RR_TAG}")
-            dm = dp if mid_pick == "All MIDs" else dp[dp[MID_COL] == mid_pick]
-            subs = full_compare(dm, [MID_COL, SUB_COL]).sort_values(rank_by, ascending=False)
-            subs["Share of MID (YTD)"] = subs.YTD__VOLUME / subs.groupby(MID_COL).YTD__VOLUME.transform("sum")
-            subs = subs.drop(columns=["N_MID", "N_SUB"])
-            tmap = subs[subs.YTD__VOLUME > 0]
-            if not tmap.empty:
-                st.plotly_chart(px.treemap(tmap, path=[px.Constant(pf), MID_COL, SUB_COL], values="YTD__VOLUME",
-                                           color="YTD__VOLUME_YoY%", color_continuous_scale="RdYlGn",
-                                           color_continuous_midpoint=0, range_color=[-1, 1],
-                                           title=f"{pf} → MID → Sub-merchant · size = YTD {CY} volume, "
-                                                 f"colour = YTD YoY % (grey = new / n.m.)")
-                                .update_traces(texttemplate="%{label}<br>%{percentParent:.1%}")
-                                .update_layout(height=560, margin=dict(t=50, l=5, r=5, b=5)), width="stretch")
-            top_s = st.slider("Top N sub-merchants", 5, 40, 15, key="pf_sub_n")
-            ts = subs.head(top_s)
-            c1, c2 = st.columns(2)
-            c1.plotly_chart(bar_rr(rr_snapshot(ts, SUB_COL, "VOLUME"), SUB_COL, "VOLUME",
-                                   f"Top {top_s} sub-merchants – {cur_m} volume", horizontal=True,
-                                   height=max(400, 30 * len(ts))), width="stretch")
-            c2.plotly_chart(ytd_vs_ly_bar(ts.drop_duplicates(SUB_COL), SUB_COL,
-                                          f"Top {top_s} sub-merchants – YTD {CY} vs YTD {LY}", top=top_s), width="stretch")
-            show_full(subs, [MID_COL, SUB_COL], extra=["Share of MID (YTD)"], height=420)
-            sub_pick2 = st.selectbox("Sub-merchant trend", subs[SUB_COL].drop_duplicates().tolist(), key="pf_sub_pick")
-            ds = dm[dm[SUB_COL] == sub_pick2]
-            ytd_kpi_block(ds, sub_pick2)
-            ts_tr = trend_actual(ds).sort_values("YEAR_MONTH")
-            ts_tr = ts_tr[ts_tr.YEAR_MONTH >= prev_month(cur_m, 12)]
-            c1, c2 = st.columns(2)
-            c1.plotly_chart(bar_rr(ts_tr, "LABEL", "VOLUME", f"{sub_pick2} – Monthly Volume (last 13 months)"),
-                            width="stretch")
-            c2.plotly_chart(rate_line(ts_tr, "LABEL", ["WEIGHTED_MDR", "WEIGHTED_IC"],
-                                      f"{sub_pick2} – Weighted MDR vs Interchange (not run-rated)"), width="stretch")
-
-# ================================================================ TAB 7 – PROFITABILITY MAP (net MDR revenue)
-with tab_prof:
-    if need_card():
-        st.caption(
-            "Profitability basis = **net MDR revenue** = Σ(MDR × volume) − Σ(interchange rate × volume), i.e. gross "
-            "MDR revenue net of interchange. Other costs/income (txn, MID, license, processing fees) are **not** "
-            "included. **Margin (bps)** = net MDR revenue ÷ volume × 10,000 = weighted MDR − weighted interchange. "
-            "Actuals, not run-rated. Quadrants: **high volume** = merchants that together make up the top X% of the "
-            "segment's volume; **above hurdle** = margin ≥ hurdle.")
-        cA, cB, cC = st.columns([1.3, 1.3, 1.4])
-        per = cA.radio("Period", ["YTD", "MONTH"], horizontal=True, key="prof_per",
-                       format_func=lambda x: f"YTD {CY} ({ytd_lbl})" if x == "YTD"
-                       else f"{cur_m}{' (MTD)' if CUR_FACTOR != 1 else ''}")
-        pareto = cB.select_slider("High volume = top X% of segment volume", [50, 60, 70, 80, 90, 95],
-                                  value=80, key="prof_pareto")
-        hurdle = cC.number_input("Margin hurdle (bps of volume)", value=0.0, step=5.0, key="prof_hurdle",
-                                 help="0 = MDR at least covers interchange. Raise it to require a minimum spread, "
-                                      "e.g. to cover other per-volume costs.")
-        dper = ytd_slice(df, CY, END_MM) if per == "YTD" else df[df.YEAR_MONTH == cur_m]
-        per_lbl = f"YTD {CY}" if per == "YTD" else cur_m
-
-        # ---- segment comparison
-        st.subheader(f"Direct Merchants vs Payment Facilitators – {per_lbl}")
-        rows = []
-        for s in ["Direct Merchant", "Payment Facilitator"]:
-            g = profit_table(dper[dper.PF_DM_TAG == s], "PF_DM_NAME")
-            if g.empty:
-                continue
-            g, _ = assign_quadrants(g, pareto, hurdle)
-            below = g.MARGIN_BPS < hurdle
-            rows.append({"Segment": s, "Merchants": len(g), "Volume": g.VOLUME.sum(),
-                         "Gross MDR revenue": g.MDR_REV.sum(), "Interchange": g.IC_COST.sum(),
-                         "Net MDR revenue": g.NET_REV.sum(),
-                         "Wtd MDR": g.MDR_REV.sum() / g.VOLUME.sum(), "Wtd IC": g.IC_COST.sum() / g.VOLUME.sum(),
-                         "Margin (bps)": g.NET_REV.sum() / g.VOLUME.sum() * 1e4,
-                         "# below hurdle": int(below.sum()),
-                         "Vol share below hurdle": g.loc[below, "VOLUME"].sum() / g.VOLUME.sum(),
-                         "Net MDR rev of below-hurdle": g.loc[below, "NET_REV"].sum()})
-        if rows:
-            comp = pd.DataFrame(rows)
-            st.dataframe(comp.style.format({"Volume": "{:,.0f}", "Gross MDR revenue": "{:,.0f}",
-                                            "Interchange": "{:,.0f}", "Net MDR revenue": "{:,.0f}",
-                                            "Wtd MDR": "{:.2%}", "Wtd IC": "{:.2%}", "Margin (bps)": "{:+.1f}",
-                                            "Vol share below hurdle": "{:.1%}",
-                                            "Net MDR rev of below-hurdle": "{:,.0f}"}, na_rep="-"),
-                         width="stretch", hide_index=True)
-
-        # ---- one segment
-        st.divider()
-        cA, cB = st.columns([1.3, 2])
-        seg_p = cA.radio("Segment", ["Direct Merchant", "Payment Facilitator"], horizontal=True, key="prof_seg")
-        lvl_map = {"PF_DM_NAME": ["PF_DM_NAME"]}
-        if seg_p == "Payment Facilitator":
-            lvl_map.update({MID_COL: ["PF_DM_NAME", MID_COL], SUB_COL: ["PF_DM_NAME", SUB_COL]})
-        lvl = cB.radio("Level", list(lvl_map), horizontal=True, key=f"prof_lvl_{seg_p}",
-                       format_func={"PF_DM_NAME": "Merchant / PF", MID_COL: "MID", SUB_COL: "Sub-merchant"}.get)
-        g = profit_table(dper[dper.PF_DM_TAG == seg_p], lvl_map[lvl])
-        if g.empty:
-            st.info("No volume for this segment / period.")
-        else:
-            g, vol_cut = assign_quadrants(g, pareto, hurdle)
-            tot_v, tot_rev = g.VOLUME.sum(), g.NET_REV.sum()
-            below = g.MARGIN_BPS < hurdle
-            c = st.columns(5)
-            c[0].metric(f"Volume ({per_lbl})", fmt_php(tot_v))
-            c[1].metric("Gross MDR revenue", fmt_php(g.MDR_REV.sum()), f"less interchange {fmt_php(g.IC_COST.sum())}",
-                        delta_color="off")
-            c[2].metric("Net MDR revenue", fmt_php(tot_rev), f"{tot_rev / tot_v * 1e4:+.1f} bps of volume",
-                        delta_color="off")
-            c[3].metric(f"Below hurdle ({hurdle:+.0f} bps)", f"{int(below.sum()):,} of {len(g):,}",
-                        f"{g.loc[below, 'VOLUME'].sum() / tot_v:.1%} of volume", delta_color="off")
-            c[4].metric("Net MDR rev from below-hurdle", fmt_php(g.loc[below, "NET_REV"].sum()),
-                        f"vs {fmt_php(g.loc[~below, 'NET_REV'].sum())} from the rest", delta_color="off")
-
-            qs = (g.groupby("QUADRANT").agg(Entities=("NAME", "count"), Volume=("VOLUME", "sum"),
-                                            Net_rev=("NET_REV", "sum")).reindex(list(QUAD_COLORS)).fillna(0)
-                  .reset_index())
-            qs["Vol share"] = qs.Volume / tot_v
-            qs["Rev share"] = qs.Net_rev / tot_rev if tot_rev else float("nan")
-            qs["Margin (bps)"] = qs.Net_rev / qs.Volume.where(qs.Volume > 0) * 1e4
-            st.dataframe(qs.rename(columns={"QUADRANT": "Quadrant", "Net_rev": "Net MDR revenue"})
-                         .style.format({"Entities": "{:,.0f}", "Volume": "{:,.0f}", "Net MDR revenue": "{:,.0f}",
-                                        "Vol share": "{:.1%}", "Rev share": "{:.1%}", "Margin (bps)": "{:+.1f}"},
-                                       na_rep="-"), width="stretch", hide_index=True)
-
-            # ---- map: volume (log) vs margin bps
-            lo, hi = np.nanpercentile(g.MARGIN_BPS, [2, 98])
-            lo, hi = min(lo, hurdle - 10), max(hi, hurdle + 10)
-            pad = (hi - lo) * 0.08
-            g["Y"] = g.MARGIN_BPS.clip(lo - pad, hi + pad)
-            g["Shown"] = np.where(g.MARGIN_BPS.between(lo - pad, hi + pad), "in range", "clipped (outlier)")
-            g["SIZE"] = g.NET_REV.abs()
-            hov = {"VOLUME": ":,.0f", "NET_REV": ":,.0f", "MARGIN_BPS": ":+.1f", "WTD_MDR": ":.2%", "WTD_IC": ":.2%",
-                   "TICKET": ":,.0f", "Y": False, "SIZE": False, "Shown": False, "QUADRANT": False}
-            lbl = {"VOLUME": f"Volume ({per_lbl}, log scale)", "Y": "Net MDR margin (bps)",
-                   "NET_REV": "Net MDR revenue", "MARGIN_BPS": "Margin bps", "WTD_MDR": "Wtd MDR",
-                   "WTD_IC": "Wtd IC", "TICKET": "Avg ticket"}
-            fig = px.scatter(g, x="VOLUME", y="Y", color="QUADRANT", size="SIZE", size_max=40, log_x=True,
-                             symbol="Shown", symbol_map={"in range": "circle", "clipped (outlier)": "triangle-up"},
-                             color_discrete_map=QUAD_COLORS, category_orders={"QUADRANT": list(QUAD_COLORS)},
-                             hover_name="NAME", hover_data=hov, labels=lbl,
-                             title=f"Profitability map – {seg_p} ({per_lbl}) · bubble size = |net MDR revenue|")
-            fig.add_hline(y=hurdle, line_dash="dash", line_color="grey",
-                          annotation_text=f"hurdle {hurdle:+.0f} bps", annotation_position="top left")
-            fig.add_vline(x=vol_cut, line_dash="dash", line_color="grey",
-                          annotation_text=f"high-volume cut-off {fmt_php(vol_cut)}", annotation_position="top")
-            fig.update_layout(height=620, legend_title_text="")
-            st.plotly_chart(fig, width="stretch")
-
-            # ---- MDR vs interchange: distance above the diagonal = margin
-            c1, c2 = st.columns(2)
-            f2 = px.scatter(g, x="WTD_IC", y="WTD_MDR", color="QUADRANT", size="VOLUME", size_max=30,
-                            color_discrete_map=QUAD_COLORS, hover_name="NAME",
-                            hover_data={"WTD_IC": ":.2%", "WTD_MDR": ":.2%", "MARGIN_BPS": ":+.1f",
-                                        "VOLUME": ":,.0f", "QUADRANT": False},
-                            labels={"WTD_IC": "Weighted interchange", "WTD_MDR": "Weighted MDR",
-                                    "MARGIN_BPS": "Margin bps"},
-                            title="MDR vs interchange – dotted line = MDR equals interchange "
-                                  "(below it = selling under cost); dashed = MDR equals interchange + hurdle")
-            m = max(g.WTD_MDR.max(), g.WTD_IC.max()) * 1.05
-            f2.add_shape(type="line", x0=0, y0=0, x1=m, y1=m, line=dict(dash="dot", color="grey"))
-            if hurdle:
-                f2.add_shape(type="line", x0=0, y0=hurdle / 1e4, x1=m, y1=m + hurdle / 1e4,
-                             line=dict(dash="dash", color="grey"))
-            f2.update_xaxes(tickformat=".2%", range=[0, m]).update_yaxes(tickformat=".2%", range=[0, m])
-            c1.plotly_chart(f2.update_layout(height=480, showlegend=False), width="stretch")
-            movers = pd.concat([g.nsmallest(10, "NET_REV"), g.nlargest(10, "NET_REV")]).drop_duplicates("NAME") \
-                .sort_values("NET_REV")
-            c2.plotly_chart(px.bar(movers, x="NET_REV", y="NAME", orientation="h", color="QUADRANT",
-                                   color_discrete_map=QUAD_COLORS,
-                                   title="Top 10 / bottom 10 net MDR revenue contributors (₱)",
-                                   hover_data={"MARGIN_BPS": ":+.1f", "VOLUME": ":,.0f"},
-                                   labels={"NET_REV": "Net MDR revenue"})
-                            .update_layout(height=480, showlegend=False).update_yaxes(type="category", title=None),
-                            width="stretch")
-
-            # ---- repricing view: revenue uplift if below-hurdle merchants were brought to the hurdle
-            if below.any():
-                gap = g.loc[below].assign(UPLIFT=lambda x: (hurdle - x.MARGIN_BPS) / 1e4 * x.VOLUME)
-                st.caption(f"Bringing the {int(below.sum())} below-hurdle entities up to a {hurdle:+.0f} bps margin "
-                           f"(same volume) would add **{fmt_php(gap.UPLIFT.sum())}** net MDR revenue for {per_lbl}.")
-
-            tbl = g.sort_values("MARGIN_BPS")[["NAME", "QUADRANT", "VOLUME", "VOL_SHARE", "TXN_COUNT", "TICKET",
-                                               "WTD_MDR", "WTD_IC", "MARGIN_BPS", "MDR_REV", "IC_COST", "NET_REV",
-                                               "NET_REV_PER_TXN", "MONTHS"]]
-            tbl.columns = ["Name", "Quadrant", "Volume", "Vol share", "Txn", "Avg ticket", "Wtd MDR", "Wtd IC",
-                           "Margin (bps)", "Gross MDR revenue", "Interchange", "Net MDR revenue",
-                           "Net MDR rev / txn", "Active months"]
-            st.dataframe(tbl.style.format({"Volume": "{:,.0f}", "Vol share": "{:.2%}", "Txn": "{:,.0f}",
-                                           "Avg ticket": "{:,.0f}", "Wtd MDR": "{:.2%}", "Wtd IC": "{:.2%}",
-                                           "Margin (bps)": "{:+.1f}", "Gross MDR revenue": "{:,.0f}",
-                                           "Interchange": "{:,.0f}", "Net MDR revenue": "{:,.0f}",
-                                           "Net MDR rev / txn": "{:,.2f}"}, na_rep="-"),
-                         width="stretch", hide_index=True, height=420)
-            st.download_button("Download profitability table (CSV)", tbl.to_csv(index=False).encode(),
-                               file_name=f"net_mdr_revenue_{seg_p.replace(' ', '_')}_{per_lbl}.csv", key="prof_dl")
-
-            # ---- monthly trend for one entity
-            pick_n = st.selectbox("Monthly trend for", g.sort_values("VOLUME", ascending=False).NAME.tolist(),
-                                  key=f"prof_pick_{seg_p}_{lvl}")
-            keys = lvl_map[lvl]
-            sel_row = g[g.NAME == pick_n].iloc[0]
-            mask = np.logical_and.reduce([df[k].astype(str) == str(sel_row[k]) for k in keys])
-            dsel = df[(df.PF_DM_TAG == seg_p) & mask & (df.YEAR_MONTH <= cur_m)
-                      & (df.YEAR_MONTH >= prev_month(cur_m, 12))]
-            mt = profit_table(dsel, "YEAR_MONTH").sort_values("YEAR_MONTH")
-            c1, c2 = st.columns(2)
-            c1.plotly_chart(px.bar(mt, x="YEAR_MONTH", y="NET_REV",
-                                   title=f"{pick_n} – monthly net MDR revenue (₱, actual)",
-                                   color=(mt.NET_REV >= 0).map({True: "Positive", False: "Negative"}),
-                                   color_discrete_map={"Positive": "#2E8B57", "Negative": "#C0392B"},
-                                   labels={"NET_REV": "Net MDR revenue"})
-                            .update_layout(showlegend=False).update_xaxes(type="category"), width="stretch")
-            c2.plotly_chart(rate_line(mt, "YEAR_MONTH", ["WTD_MDR", "WTD_IC"],
-                                      f"{pick_n} – weighted MDR vs interchange (gap = margin)"), width="stretch")
-            if cur_m == LATEST_M and CUR_FACTOR != 1:
-                st.caption(f"{cur_m} is month-to-date (as of {card_asof:%b %d}); net MDR revenue is MTD, "
-                           "margins are unaffected.")
-
-
-# ================================================================ TAB 8 – QRPH
-with tab_qr:
+# ================================================================ 7 – QRPH
+if PAGE == PAGES[6]:
     if not HAS_QR:
         st.info("Upload the QRPH sheet in the sidebar (needs YEAR_MONTH, VOLUME_POSTED, TXN_COUNT_POSTED).")
     else:
