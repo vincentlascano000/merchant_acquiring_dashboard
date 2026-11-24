@@ -7,7 +7,7 @@ Data sources - found automatically in the repo (root, data/, data/qrph/, data/ca
 or uploaded in the sidebar (also auto-detected):
   * Card MIS : YEAR_MONTH, [MAX_TRAN_DATE -> automatic as-of date for the run-rate], PF_DM_TAG, PF_DM_NAME,
                MERCHANT_NAME_ORIG, CARD_ACCEPTOR_ID (MID), INDUSTRY, TRXN_CODE, TOTAL_VOLUME, TOTAL_COUNT, MDR,
-               INTERCHANGE_RATE, INTERCHANGE_EXPENSE_PHP
+               INTERCHANGE_RATE, INTERCHANGE_EXPENSE_PHP, [NET_INCOME -> Profitability Map tab]
   * QRPH     : YEAR_MONTH, VOLUME_POSTED, TXN_COUNT_POSTED (other columns ignored)
 
 Run-rate rule (per source): ONLY each source's latest month is run-rated (MTD x days / as-of day).
@@ -24,6 +24,7 @@ import os
 import re
 from datetime import date
 
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
@@ -31,7 +32,6 @@ from streamlit.delta_generator import DeltaGenerator as _DG
 
 st.set_page_config(page_title="Merchant Acquiring Dashboard", layout="wide")
 
-# unique key for every chart (avoids StreamlitDuplicateElementId when identical charts appear on two tabs)
 _orig_plotly_chart = _DG.plotly_chart
 _CHART_N = [0]
 
@@ -60,12 +60,17 @@ CARD_REQUIRED = ["YEAR_MONTH", "PF_DM_TAG", "PF_DM_NAME", "INDUSTRY", "TRXN_CODE
                  "TOTAL_COUNT", "MDR", "INTERCHANGE_RATE", "INTERCHANGE_EXPENSE_PHP"]
 QRPH_REQUIRED = ["YEAR_MONTH", "VOLUME_POSTED", "TXN_COUNT_POSTED"]
 DATE_COL = "MAX_TRAN_DATE"
+NI_COL = "NET_INCOME"
 SUB_COL = "MERCHANT_NAME_ORIG"
 MID_COL = "MID"
 MON = calendar.month_abbr
 RR_LEGEND = ("Run-rated month: **solid** = MTD actual, **hatched / dotted ★** = run-rate, "
              "**open ○** = MTD actual point. Ratios (MDR, interchange rate, ticket size) are not run-rated.")
 SEPS = [",", ";", "\t", "|"]
+QUAD_COLORS = {"① Protect – high volume, profitable": "#2E8B57",
+               "② Fix – high volume, below hurdle": "#C0392B",
+               "③ Grow – low volume, profitable": "#2F80ED",
+               "④ Review – low volume, below hurdle": "#F2994A"}
 
 
 # ================================================================ LOADING
@@ -136,18 +141,17 @@ def _norm_mid(s):
 
 
 def _parse_dates(s):
-    """Robust date parser: 2024-01-31 / 2024-01-31 00:00:00 / 1/31/2024 / 31-Jan-2024 / Excel serial 45322."""
     if pd.api.types.is_datetime64_any_dtype(s):
         return s
     raw = s.astype(str).str.strip().replace({"": None, "nan": None, "NaT": None, "None": None})
-    out = pd.to_datetime(raw.str[:10], format="%Y-%m-%d", errors="coerce")          # ISO first
+    out = pd.to_datetime(raw.str[:10], format="%Y-%m-%d", errors="coerce")
     for fmt in ("%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d", "%d-%b-%Y", "%d-%b-%y", "%m/%d/%y"):
         miss = out.isna() & raw.notna()
         if not miss.any():
             break
         out = out.fillna(pd.to_datetime(raw.where(miss).str.split(" ").str[0], format=fmt, errors="coerce"))
     miss = out.isna() & raw.notna()
-    if miss.any():                                                                   # Excel serial numbers
+    if miss.any():
         num = pd.to_numeric(raw.where(miss), errors="coerce")
         ser = pd.to_datetime(num.where(num.between(20000, 80000)), unit="D", origin="1899-12-30", errors="coerce")
         out = out.fillna(ser)
@@ -175,8 +179,11 @@ def load_sources(files):
     if card:
         cdf = pd.concat(card, ignore_index=True)
         cdf["YEAR_MONTH"] = _norm_ym(cdf["YEAR_MONTH"])
-        for c in ["TOTAL_VOLUME", "TOTAL_COUNT", "MDR", "INTERCHANGE_RATE", "INTERCHANGE_EXPENSE_PHP"]:
-            cdf[c] = pd.to_numeric(cdf[c], errors="coerce").fillna(0)
+        num_cols = ["TOTAL_VOLUME", "TOTAL_COUNT", "MDR", "INTERCHANGE_RATE", "INTERCHANGE_EXPENSE_PHP"]
+        if NI_COL in cdf.columns:
+            num_cols.append(NI_COL)
+        for c in num_cols:
+            cdf[c] = pd.to_numeric(cdf[c].astype(str).str.replace(",", ""), errors="coerce").fillna(0)
         if SUB_COL not in cdf.columns:
             cdf[SUB_COL] = cdf["PF_DM_NAME"]
         cdf[SUB_COL] = cdf[SUB_COL].fillna("UNTAGGED").astype(str).str.strip()
@@ -216,9 +223,6 @@ def _sniff_header(path):
 
 @st.cache_data(ttl=300)
 def scan_repo():
-    """Classify every csv/xlsx by header. Returns {'card': [paths best-first], 'qrph': [...], '_all': [...]}.
-    Card files WITH a MAX_TRAN_DATE column rank first (git clones give all files the same timestamp,
-    so modification time alone can't tell old from new)."""
     found, allf = {"card": [], "qrph": []}, []
     for d in SCAN_DIRS:
         if not os.path.isdir(d):
@@ -507,7 +511,6 @@ if not HAS_QR:
 
 
 def data_max_tran_date(d, ym):
-    """(date or None, reason). Latest MAX_TRAN_DATE among rows of month `ym`, clipped to that month."""
     if DATE_COL not in d.columns:
         return None, f"the loaded card file has no {DATE_COL} column"
     s_all = d.loc[d["YEAR_MONTH"] == ym, DATE_COL]
@@ -558,8 +561,7 @@ if HAS_QR:
         dflt = max(_t.day - 1, 1)
     else:
         dflt = 31
-    QR_RR, _ = month_picker_date(f"QRPH data as of ({QR_LATEST})", QR_LATEST, dflt,
-                                 f"asof_qr_{dflt}")                      # key tracks card date so it follows it
+    QR_RR, _ = month_picker_date(f"QRPH data as of ({QR_LATEST})", QR_LATEST, dflt, f"asof_qr_{dflt}")
     st.sidebar.caption(f"QRPH run-rate ({QR_LATEST} only): **{QR_RR:.3f}x**")
 
 st.sidebar.divider()
@@ -872,6 +874,38 @@ def ytd_vs_ly_bar(t, key, title, top=15):
         height=max(380, 32 * len(t)), legend_title_text="")
 
 
+# ================================================================ PROFITABILITY HELPERS
+def profit_table(d, keys):
+    """Per-entity volume, NET_INCOME, NI margin (bps of volume), MDR–IC spread (bps), ticket size.
+    Uses ACTUAL figures (no run-rate) – margins are ratios so they are period-consistent."""
+    keys = keys if isinstance(keys, list) else [keys]
+    g = d.groupby(keys, dropna=False).agg(
+        VOLUME=("TOTAL_VOLUME", "sum"), TXN_COUNT=("TOTAL_COUNT", "sum"), NI=(NI_COL, "sum"),
+        MDR_X_VOL=("MDR_X_VOL", "sum"), IC_X_VOL=("IC_X_VOL", "sum"),
+        MONTHS=("YEAR_MONTH", "nunique")).reset_index()
+    g = g[g.VOLUME > 0].copy()
+    g["WTD_MDR"] = g.MDR_X_VOL / g.VOLUME
+    g["WTD_IC"] = g.IC_X_VOL / g.VOLUME
+    g["SPREAD_BPS"] = (g.WTD_MDR - g.WTD_IC) * 1e4
+    g["NI_BPS"] = g.NI / g.VOLUME * 1e4
+    g["TICKET"] = g.VOLUME / g.TXN_COUNT.where(g.TXN_COUNT > 0)
+    g["NAME"] = g[keys].astype(str).agg(" › ".join, axis=1)
+    return g.drop(columns=["MDR_X_VOL", "IC_X_VOL"])
+
+
+def assign_quadrants(g, pareto_pct, hurdle_bps):
+    g = g.sort_values("VOLUME", ascending=False).copy()
+    share = g.VOLUME / g.VOLUME.sum()
+    g["VOL_SHARE"] = share
+    g["HIGH_VOL"] = (share.cumsum() - share) < pareto_pct / 100      # merchants making up the top X% of volume
+    vol_cut = g.loc[g.HIGH_VOL, "VOLUME"].min() if g.HIGH_VOL.any() else g.VOLUME.max()
+    prof = g.NI_BPS >= hurdle_bps
+    quads = list(QUAD_COLORS)
+    g["QUADRANT"] = np.select([g.HIGH_VOL & prof, g.HIGH_VOL & ~prof, ~g.HIGH_VOL & prof],
+                              quads[:3], default=quads[3])
+    return g, vol_cut
+
+
 # ================================================================ HEADER & TABS
 st.title("Merchant Acquiring Dashboard")
 notes = []
@@ -883,9 +917,10 @@ st.caption(f"Reporting month: **{cur_m}** · MoM vs **{mom_m}** · YoY vs **{yoy
            + " · ".join(notes) + " · all earlier months are actuals")
 st.caption(RR_LEGEND)
 
-tab_tot, tab_yoy, tab_ovw, tab_cat, tab_mer, tab_pf, tab_qr = st.tabs(
+tab_tot, tab_yoy, tab_ovw, tab_cat, tab_mer, tab_pf, tab_prof, tab_qr = st.tabs(
     ["1 · Total Acquiring (Card + QRPH)", "2 · Card YoY & YTD", "3 · PF vs DM Overview",
-     "4 · Category Mix", "5 · Merchant Level", "6 · PF Level (MID → Sub-merchant)", "7 · QRPH"])
+     "4 · Category Mix", "5 · Merchant Level", "6 · PF Level (MID → Sub-merchant)", "7 · Profitability Map",
+     "8 · QRPH"])
 
 card_a = None
 if HAS_CARD:
@@ -1270,7 +1305,168 @@ with tab_pf:
             c2.plotly_chart(rate_line(ts_tr, "LABEL", ["WEIGHTED_MDR", "WEIGHTED_IC"],
                                       f"{sub_pick2} – Weighted MDR vs Interchange (not run-rated)"), width="stretch")
 
-# ================================================================ TAB 7 – QRPH
+# ================================================================ TAB 7 – PROFITABILITY MAP
+with tab_prof:
+    if need_card():
+        if NI_COL not in df.columns:
+            st.info(f"The loaded card file has no {NI_COL} column – the profitability map needs it.")
+        else:
+            st.caption(
+                f"Profitability = **{NI_COL}** as reported in the MIS (actuals – not run-rated). "
+                "**NI margin (bps)** = NET_INCOME ÷ volume × 10,000; **Spread (bps)** = weighted MDR − weighted "
+                "interchange. Quadrants: **high volume** = merchants that together make up the top X% of the "
+                "segment's volume; **profitable** = NI margin ≥ hurdle.")
+            cA, cB, cC = st.columns([1.3, 1.3, 1.4])
+            per = cA.radio("Period", ["YTD", "MONTH"], horizontal=True, key="prof_per",
+                           format_func=lambda x: f"YTD {CY} ({ytd_lbl})" if x == "YTD"
+                           else f"{cur_m}{' (MTD)' if CUR_FACTOR != 1 else ''}")
+            pareto = cB.select_slider("High volume = top X% of segment volume", [50, 60, 70, 80, 90, 95],
+                                      value=80, key="prof_pareto")
+            hurdle = cC.number_input("NI margin hurdle (bps)", value=0.0, step=5.0, key="prof_hurdle")
+            dper = ytd_slice(df, CY, END_MM) if per == "YTD" else df[df.YEAR_MONTH == cur_m]
+            per_lbl = f"YTD {CY}" if per == "YTD" else cur_m
+
+            # ---- segment comparison
+            st.subheader(f"Direct Merchants vs Payment Facilitators – {per_lbl}")
+            rows = []
+            for s in ["Direct Merchant", "Payment Facilitator"]:
+                g = profit_table(dper[dper.PF_DM_TAG == s], "PF_DM_NAME")
+                if g.empty:
+                    continue
+                g, _ = assign_quadrants(g, pareto, hurdle)
+                loss = g.NI_BPS < hurdle
+                rows.append({"Segment": s, "Merchants": len(g), "Volume": g.VOLUME.sum(), "Net income": g.NI.sum(),
+                             "NI margin (bps)": g.NI.sum() / g.VOLUME.sum() * 1e4,
+                             "Spread (bps)": ((g.WTD_MDR - g.WTD_IC) * g.VOLUME).sum() / g.VOLUME.sum() * 1e4,
+                             "# below hurdle": int(loss.sum()),
+                             "Vol share below hurdle": g.loc[loss, "VOLUME"].sum() / g.VOLUME.sum(),
+                             "NI of below-hurdle": g.loc[loss, "NI"].sum()})
+            if rows:
+                comp = pd.DataFrame(rows)
+                st.dataframe(comp.style.format({"Volume": "{:,.0f}", "Net income": "{:,.0f}",
+                                                "NI margin (bps)": "{:+.1f}", "Spread (bps)": "{:+.1f}",
+                                                "Vol share below hurdle": "{:.1%}", "NI of below-hurdle": "{:,.0f}"},
+                                               na_rep="-"), width="stretch", hide_index=True)
+
+            # ---- one segment
+            st.divider()
+            cA, cB = st.columns([1.3, 2])
+            seg_p = cA.radio("Segment", ["Direct Merchant", "Payment Facilitator"], horizontal=True, key="prof_seg")
+            lvl_map = {"PF_DM_NAME": ["PF_DM_NAME"]}
+            if seg_p == "Payment Facilitator":
+                lvl_map.update({MID_COL: ["PF_DM_NAME", MID_COL], SUB_COL: ["PF_DM_NAME", SUB_COL]})
+            lvl = cB.radio("Level", list(lvl_map), horizontal=True, key=f"prof_lvl_{seg_p}",
+                           format_func={"PF_DM_NAME": "Merchant / PF", MID_COL: "MID",
+                                        SUB_COL: "Sub-merchant"}.get)
+            dseg = dper[dper.PF_DM_TAG == seg_p]
+            g = profit_table(dseg, lvl_map[lvl])
+            if g.empty:
+                st.info("No volume for this segment / period.")
+            else:
+                g, vol_cut = assign_quadrants(g, pareto, hurdle)
+                tot_v, tot_ni = g.VOLUME.sum(), g.NI.sum()
+                below = g.NI_BPS < hurdle
+                c = st.columns(5)
+                c[0].metric(f"Volume ({per_lbl})", fmt_php(tot_v))
+                c[1].metric("Net income", fmt_php(tot_ni))
+                c[2].metric("NI margin", f"{tot_ni / tot_v * 1e4:+.1f} bps")
+                c[3].metric(f"Below hurdle ({hurdle:+.0f} bps)", f"{int(below.sum()):,} of {len(g):,}",
+                            f"{g.loc[below, 'VOLUME'].sum() / tot_v:.1%} of volume", delta_color="off")
+                c[4].metric("NI drag from below-hurdle", fmt_php(g.loc[below, "NI"].sum()),
+                            f"vs {fmt_php(g.loc[~below, 'NI'].sum())} from the rest", delta_color="off")
+
+                # quadrant summary
+                qs = (g.groupby("QUADRANT").agg(Entities=("NAME", "count"), Volume=("VOLUME", "sum"),
+                                                Net_income=("NI", "sum")).reindex(list(QUAD_COLORS)).fillna(0)
+                      .reset_index())
+                qs["Vol share"] = qs.Volume / tot_v
+                qs["NI margin (bps)"] = qs.Net_income / qs.Volume.where(qs.Volume > 0) * 1e4
+                st.dataframe(qs.rename(columns={"QUADRANT": "Quadrant", "Net_income": "Net income"})
+                             .style.format({"Entities": "{:,.0f}", "Volume": "{:,.0f}", "Net income": "{:,.0f}",
+                                            "Vol share": "{:.1%}", "NI margin (bps)": "{:+.1f}"}, na_rep="-"),
+                             width="stretch", hide_index=True)
+
+                # map: volume (log) vs NI margin; y clipped to 2nd–98th pct so a few tiny accounts don't squash it
+                lo, hi = np.nanpercentile(g.NI_BPS, [2, 98])
+                lo, hi = min(lo, hurdle - 10), max(hi, hurdle + 10)
+                pad = (hi - lo) * 0.08
+                g["Y"] = g.NI_BPS.clip(lo - pad, hi + pad)
+                g["Shown"] = np.where(g.NI_BPS.between(lo - pad, hi + pad), "in range", "clipped (outlier)")
+                g["SIZE"] = g.NI.abs()
+                fig = px.scatter(g, x="VOLUME", y="Y", color="QUADRANT", size="SIZE", size_max=40, log_x=True,
+                                 symbol="Shown", symbol_map={"in range": "circle", "clipped (outlier)": "triangle-up"},
+                                 color_discrete_map=QUAD_COLORS, category_orders={"QUADRANT": list(QUAD_COLORS)},
+                                 hover_name="NAME",
+                                 hover_data={"VOLUME": ":,.0f", "NI": ":,.0f", "NI_BPS": ":+.1f",
+                                             "SPREAD_BPS": ":+.1f", "TICKET": ":,.0f", "Y": False, "SIZE": False,
+                                             "Shown": False, "QUADRANT": False},
+                                 labels={"VOLUME": f"Volume ({per_lbl}, log scale)", "Y": "NI margin (bps)",
+                                         "NI": "Net income", "NI_BPS": "NI margin bps", "SPREAD_BPS": "Spread bps",
+                                         "TICKET": "Avg ticket"},
+                                 title=f"Profitability map – {seg_p} ({per_lbl}) · bubble size = |net income|")
+                fig.add_hline(y=hurdle, line_dash="dash", line_color="grey",
+                              annotation_text=f"hurdle {hurdle:+.0f} bps", annotation_position="top left")
+                fig.add_vline(x=vol_cut, line_dash="dash", line_color="grey",
+                              annotation_text=f"high-volume cut-off {fmt_php(vol_cut)}", annotation_position="top")
+                fig.update_layout(height=620, legend_title_text="")
+                st.plotly_chart(fig, width="stretch")
+
+                # spread vs NI margin – explains WHY a merchant is unprofitable
+                c1, c2 = st.columns(2)
+                f2 = px.scatter(g, x="SPREAD_BPS", y="Y", color="QUADRANT", size="VOLUME", size_max=30,
+                                color_discrete_map=QUAD_COLORS, hover_name="NAME",
+                                hover_data={"SPREAD_BPS": ":+.1f", "NI_BPS": ":+.1f", "TICKET": ":,.0f",
+                                            "Y": False, "VOLUME": ":,.0f", "QUADRANT": False},
+                                labels={"SPREAD_BPS": "MDR − interchange spread (bps)", "Y": "NI margin (bps)"},
+                                title="Spread vs NI margin – positive spread but negative NI ⇒ cost-driven "
+                                      "(fixed / per-txn costs, small tickets)")
+                f2.add_hline(y=hurdle, line_dash="dash", line_color="grey")
+                f2.add_vline(x=0, line_dash="dash", line_color="grey")
+                c1.plotly_chart(f2.update_layout(height=480, showlegend=False), width="stretch")
+                movers = pd.concat([g.nsmallest(10, "NI"), g.nlargest(10, "NI")]).drop_duplicates("NAME") \
+                    .sort_values("NI")
+                c2.plotly_chart(px.bar(movers, x="NI", y="NAME", orientation="h", color="QUADRANT",
+                                       color_discrete_map=QUAD_COLORS, title="Top 10 profit and loss contributors (₱)",
+                                       hover_data={"NI_BPS": ":+.1f", "VOLUME": ":,.0f"})
+                                .update_layout(height=480, showlegend=False).update_yaxes(type="category", title=None),
+                                width="stretch")
+
+                tbl = g.sort_values("NI")[["NAME", "QUADRANT", "VOLUME", "VOL_SHARE", "TXN_COUNT", "TICKET", "NI",
+                                           "NI_BPS", "WTD_MDR", "WTD_IC", "SPREAD_BPS", "MONTHS"]]
+                tbl.columns = ["Name", "Quadrant", "Volume", "Vol share", "Txn", "Avg ticket", "Net income",
+                               "NI margin (bps)", "Wtd MDR", "Wtd IC", "Spread (bps)", "Active months"]
+                st.dataframe(tbl.style.format({"Volume": "{:,.0f}", "Vol share": "{:.2%}", "Txn": "{:,.0f}",
+                                               "Avg ticket": "{:,.0f}", "Net income": "{:,.0f}",
+                                               "NI margin (bps)": "{:+.1f}", "Wtd MDR": "{:.2%}", "Wtd IC": "{:.2%}",
+                                               "Spread (bps)": "{:+.1f}"}, na_rep="-"),
+                             width="stretch", hide_index=True, height=420)
+                st.download_button("Download profitability table (CSV)", tbl.to_csv(index=False).encode(),
+                                   file_name=f"profitability_{seg_p.replace(' ', '_')}_{per_lbl}.csv",
+                                   key="prof_dl")
+
+                # trend for one entity
+                pick_n = st.selectbox("Monthly NI trend for", g.sort_values("VOLUME", ascending=False).NAME.tolist(),
+                                      key=f"prof_pick_{seg_p}_{lvl}")
+                keys = lvl_map[lvl]
+                sel_row = g[g.NAME == pick_n].iloc[0]
+                mask = np.logical_and.reduce([df[k].astype(str) == str(sel_row[k]) for k in keys])
+                dsel = df[(df.PF_DM_TAG == seg_p) & mask & (df.YEAR_MONTH <= cur_m)
+                          & (df.YEAR_MONTH >= prev_month(cur_m, 12))]
+                mt = profit_table(dsel, "YEAR_MONTH").sort_values("YEAR_MONTH")
+                c1, c2 = st.columns(2)
+                c1.plotly_chart(px.bar(mt, x="YEAR_MONTH", y="NI", title=f"{pick_n} – monthly net income (₱, actual)",
+                                       color=(mt.NI >= 0).map({True: "Profit", False: "Loss"}),
+                                       color_discrete_map={"Profit": "#2E8B57", "Loss": "#C0392B"})
+                                .update_layout(showlegend=False).update_xaxes(type="category"), width="stretch")
+                c2.plotly_chart(px.line(mt, x="YEAR_MONTH", y=["NI_BPS", "SPREAD_BPS"], markers=True,
+                                        title=f"{pick_n} – NI margin vs spread (bps)")
+                                .add_hline(y=hurdle, line_dash="dash", line_color="grey")
+                                .update_layout(legend_title_text="").update_xaxes(type="category"), width="stretch")
+                if cur_m == LATEST_M and CUR_FACTOR != 1:
+                    st.caption(f"{cur_m} is month-to-date (as of {card_asof:%b %d}); fixed monthly costs may make "
+                               "its NI margin look worse than a full month.")
+
+# ================================================================ TAB 8 – QRPH
 with tab_qr:
     if not HAS_QR:
         st.info("Upload the QRPH sheet in the sidebar (needs YEAR_MONTH, VOLUME_POSTED, TXN_COUNT_POSTED).")
