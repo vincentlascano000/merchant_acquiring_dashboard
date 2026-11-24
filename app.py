@@ -5,8 +5,8 @@ Requirements: streamlit>=1.50, pandas, plotly, openpyxl
 
 Data sources - found automatically in the repo (root, data/, data/qrph/, data/card/) by COLUMN HEADERS,
 or uploaded in the sidebar (also auto-detected):
-  * Card MIS : YEAR_MONTH, PF_DM_TAG, PF_DM_NAME, MERCHANT_NAME_ORIG, INDUSTRY, TRXN_CODE, TOTAL_VOLUME,
-               TOTAL_COUNT, MDR, INTERCHANGE_RATE, INTERCHANGE_EXPENSE_PHP
+  * Card MIS : YEAR_MONTH, PF_DM_TAG, PF_DM_NAME, MERCHANT_NAME_ORIG, CARD_ACCEPTOR_ID (MID), INDUSTRY, TRXN_CODE,
+               TOTAL_VOLUME, TOTAL_COUNT, MDR, INTERCHANGE_RATE, INTERCHANGE_EXPENSE_PHP
   * QRPH     : YEAR_MONTH, VOLUME_POSTED, TXN_COUNT_POSTED (other columns ignored)
 
 Run-rate rule (per source): ONLY each source's latest month is run-rated (MTD x days / as-of day).
@@ -27,8 +27,6 @@ import streamlit as st
 
 st.set_page_config(page_title="Merchant Acquiring Dashboard", layout="wide")
 
-# Every .csv / .xlsx in these folders is classified by its headers (file name doesn't matter).
-# If several files of the same type exist, the most recently modified one is used.
 SCAN_DIRS = [".", "data", "data/qrph", "data/card"]
 TAG_COLORS = {"Direct Merchant": "#F28C28", "Payment Facilitator": "#1F4E79"}
 SRC_COLORS = {"Card (PF + DM)": "#1F4E79", "QRPH": "#2E8B57"}
@@ -36,12 +34,14 @@ RR_COLOR = "#E8541E"
 BASIS_ORDER = ["Actual", "Actual (MTD)", "Run-rate uplift"]
 FLOW_COLS = ["VOLUME", "TXN_COUNT", "INTERCHANGE_PHP"]
 CAT_TOP_N = 10
+MID_TOP_N = 8
 OTHERS_LABEL = "Others"
 MIN_LY_BASE = 1_000_000
 CARD_REQUIRED = ["YEAR_MONTH", "PF_DM_TAG", "PF_DM_NAME", "INDUSTRY", "TRXN_CODE", "TOTAL_VOLUME",
                  "TOTAL_COUNT", "MDR", "INTERCHANGE_RATE", "INTERCHANGE_EXPENSE_PHP"]
 QRPH_REQUIRED = ["YEAR_MONTH", "VOLUME_POSTED", "TXN_COUNT_POSTED"]
 SUB_COL = "MERCHANT_NAME_ORIG"
+MID_COL = "MID"                     # built from CARD_ACCEPTOR_ID
 MON = calendar.month_abbr
 RR_LEGEND = ("Run-rated month: **solid** = MTD actual, **hatched / dotted ★** = run-rate, "
              "**open ○** = MTD actual point. Ratios (MDR, interchange rate, ticket size) are not run-rated.")
@@ -51,7 +51,7 @@ SEPS = [",", ";", "\t", "|"]
 # ================================================================ LOADING
 def _clean_col(c):
     c = str(c).replace("\ufeff", "").replace("ï»¿", "").strip().strip('"').strip("'").upper()
-    return re.sub(r"[^A-Z0-9]+", "_", c).strip("_")       # "Volume Posted" -> VOLUME_POSTED
+    return re.sub(r"[^A-Z0-9]+", "_", c).strip("_")
 
 
 def classify(cols):
@@ -64,7 +64,6 @@ def classify(cols):
 
 
 def _header_row(lines):
-    """Index of the first line that looks like the header (contains YEAR_MONTH); skips title rows."""
     for i, ln in enumerate(lines[:15]):
         if "YEAR_MONTH" in {_clean_col(x) for x in re.split(r"[,;\t|]", ln)}:
             return i
@@ -92,7 +91,8 @@ def _read_any(src, name):
             lines = head.splitlines()
             skip = _header_row(lines)
             sep = max(SEPS, key=(lines[skip] if lines else "").count)
-            return pd.read_csv(src, encoding=enc, low_memory=False, sep=sep, skiprows=skip)
+            return pd.read_csv(src, encoding=enc, low_memory=False, sep=sep, skiprows=skip,
+                               dtype={"CARD_ACCEPTOR_ID": str})
         except UnicodeDecodeError:
             continue
     raise ValueError(f"{name}: could not decode file")
@@ -105,6 +105,16 @@ def _norm_ym(s):
     if (~ok).any():
         out = out.fillna(pd.to_datetime(s[~ok], errors="coerce").dt.strftime("%Y-%m"))
     return out
+
+
+def _norm_mid(s):
+    s = s.astype(str).str.strip()
+    s = s.str.replace(r"\.0$", "", regex=True)
+    # scientific notation from Excel (7.25E+12) -> full digits
+    sci = s.str.match(r"^\d+(\.\d+)?[eE]\+\d+$")
+    if sci.any():
+        s = s.where(~sci, pd.to_numeric(s[sci], errors="coerce").map(lambda v: f"{v:.0f}"))
+    return s.replace({"nan": "NO MID", "": "NO MID", "None": "NO MID"})
 
 
 @st.cache_data(show_spinner="Loading files…")
@@ -132,6 +142,7 @@ def load_sources(files):
         if SUB_COL not in cdf.columns:
             cdf[SUB_COL] = cdf["PF_DM_NAME"]
         cdf[SUB_COL] = cdf[SUB_COL].fillna("UNTAGGED").astype(str).str.strip()
+        cdf[MID_COL] = _norm_mid(cdf["CARD_ACCEPTOR_ID"]) if "CARD_ACCEPTOR_ID" in cdf.columns else "NO MID"
         cdf["MDR_X_VOL"] = cdf["MDR"] * cdf["TOTAL_VOLUME"]
         cdf["IC_X_VOL"] = cdf["INTERCHANGE_RATE"] * cdf["TOTAL_VOLUME"]
         cdf["INTERCHANGE_PHP"] = -cdf["INTERCHANGE_EXPENSE_PHP"]
@@ -277,7 +288,6 @@ def expand_rr(g, val):
 
 
 def bar_rr(g, cat, val, title, color=None, cmap=None, horizontal=False, fmt=fmt_php, height=None):
-    """Bar chart of ACTUAL values (needs _F). Run-rated rows get a hatched uplift segment + 'RR' label."""
     long = expand_rr(g, val)
     xy = dict(x=val, y=cat, orientation="h") if horizontal else dict(x=cat, y=val)
     pat = dict(pattern_shape="BASIS",
@@ -313,7 +323,6 @@ def bar_rr(g, cat, val, title, color=None, cmap=None, horizontal=False, fmt=fmt_
 
 
 def line_rr(g, x, y, title, color=None, order=None, cum=False, y_rr=None, tickformat=None, cmap=None):
-    """Line of ACTUALS; run-rated rows (_F != 1) get a dotted connector to a ★ run-rate point + ○ MTD actual."""
     g = g.copy().sort_values("YEAR_MONTH")
     if color is None:
         g["Series"] = "Total"
@@ -458,9 +467,10 @@ mom_m, yoy_m = prev_month(cur_m, 1), prev_month(cur_m, 12)
 cp = pd.Period(cur_m, "M")
 CY, LY, END_MM = cp.year, cp.year - 1, cp.month
 ytd_lbl = f"Jan–{MON[END_MM]}"
-VOL_LBL = "Volume (RR)" if CUR_FACTOR != 1 else "Volume"
-TXN_LBL = "Txn Count (RR)" if CUR_FACTOR != 1 else "Txn Count"
-IC_LBL = "Interchange ₱ (RR)" if CUR_FACTOR != 1 else "Interchange ₱"
+RR_TAG = " (RR)" if CUR_FACTOR != 1 else ""
+VOL_LBL = f"Volume{RR_TAG}"
+TXN_LBL = f"Txn Count{RR_TAG}"
+IC_LBL = f"Interchange ₱{RR_TAG}"
 
 
 # ================================================================ CARD PERIOD LOGIC
@@ -515,6 +525,23 @@ def ytd_compare(d, by):
         t[f"{m}_FY_YoY%"] = t[f"{m}_FY"] / t[f"{m}_FYLY"] - 1
     for m in ["WEIGHTED_MDR", "BLENDED_MDR", "WEIGHTED_IC", "BLENDED_IC"]:
         t[f"{m}_YoY_bps"] = (t[m] - t[f"{m}_LY"]) * 1e4
+    return t
+
+
+def full_compare(d, by):
+    """One row per key: current month (RR) / prev month / same month LY / YTD CY / YTD LY / FY outlook,
+    plus active sub-merchant & MID counts in the reporting month."""
+    by = by if isinstance(by, list) else [by]
+    p = period_table(d, by)
+    y = ytd_compare(d, by)
+    keep = by + [c for c in y.columns if c not in by]
+    y = y[keep].rename(columns={c: f"YTD__{c}" for c in keep if c not in by})
+    t = p.merge(y, on=by, how="outer")
+    cur = d[d.YEAR_MONTH == cur_m]
+    cnt = cur.groupby(by).agg(N_SUB=(SUB_COL, "nunique"), N_MID=(MID_COL, "nunique")).reset_index()
+    t = t.merge(cnt, on=by, how="left")
+    t.loc[t["YTD__VOLUME_LY"].fillna(0) < MIN_LY_BASE, "YTD__VOLUME_YoY%"] = float("nan")
+    t.loc[t["VOLUME_LY"].fillna(0) < MIN_LY_BASE / 10, "VOLUME_YoY%"] = float("nan")
     return t
 
 
@@ -580,11 +607,10 @@ def series_kpis(res, title, rr=False):
     c[4].metric(f"FY {CY} Volume (RR)", fmt_php(v["FY"]), f"{fmt_pct(v['FY_YoY%'])} vs FY {LY} {fmt_php(v['FYLY'])}")
 
 
-def year_filter(g, key, default_last=None):
+def year_filter(g, key, default_last=None, label="Years shown in monthly charts"):
     g = g[g.YEAR_MONTH <= cur_m]
     yrs = sorted(g.YEAR.unique())
-    sel = st.multiselect("Years shown in monthly charts", yrs,
-                         default=yrs if default_last is None else yrs[-default_last:], key=key)
+    sel = st.multiselect(label, yrs, default=yrs if default_last is None else yrs[-default_last:], key=key)
     return g[g.YEAR.isin(sel)]
 
 
@@ -608,7 +634,6 @@ def kpi_row(t):
 
 
 def ytd_kpi_block(d, label):
-    """YTD CY vs YTD LY + FY outlook for any card slice (merchant, sub-merchant, ...)."""
     t = ytd_compare(d.assign(ALL=label), "ALL").iloc[0]
     small_ly = pd.isna(t.VOLUME_LY) or t.VOLUME_LY < MIN_LY_BASE
     vol_yoy = "n.m. (LY base too small)" if small_ly else f"{fmt_pct(t['VOLUME_YoY%'])} YoY"
@@ -667,6 +692,45 @@ def show_ytd(tb, key):
     st.dataframe(out.style.format(fmt, na_rep="-"), width="stretch", hide_index=True)
 
 
+# One table with YTD/YoY first, then month/MoM – used by the PF sheet
+FULL_COLS = {
+    "YTD__VOLUME": f"YTD Vol {CY}", "YTD__VOLUME_LY": f"YTD Vol {LY}", "YTD__VOLUME_YoY%": "YTD Vol YoY",
+    "YTD__TXN_COUNT": f"YTD Txn {CY}", "YTD__TXN_COUNT_YoY%": "YTD Txn YoY",
+    "YTD__WEIGHTED_MDR": "YTD Wtd MDR", "YTD__WEIGHTED_MDR_YoY_bps": "YTD MDR YoY (bps)",
+    "YTD__WEIGHTED_IC": "YTD Wtd IC", "YTD__WEIGHTED_IC_YoY_bps": "YTD IC YoY (bps)",
+    "YTD__VOLUME_FY": f"FY {CY} Vol (RR)", "YTD__VOLUME_FY_YoY%": "FY Vol YoY",
+    "VOLUME": f"{cur_m} Vol{RR_TAG}", "VOLUME_PM": f"{mom_m} Vol", "VOLUME_MoM%": "Vol MoM",
+    "VOLUME_LY": f"{yoy_m} Vol", "VOLUME_YoY%": "Vol YoY (month)",
+    "TXN_COUNT": f"{cur_m} Txn{RR_TAG}", "TXN_COUNT_MoM%": "Txn MoM", "TXN_COUNT_YoY%": "Txn YoY (month)",
+    "WEIGHTED_MDR": f"{cur_m} Wtd MDR", "WEIGHTED_MDR_MoM_bps": "MDR MoM (bps)",
+    "WEIGHTED_IC": f"{cur_m} Wtd IC", "WEIGHTED_IC_MoM_bps": "IC MoM (bps)",
+    "INTERCHANGE_PHP": f"{cur_m} IC ₱{RR_TAG}",
+    "N_MID": f"# MIDs ({cur_m})", "N_SUB": f"# Sub-merchants ({cur_m})",
+}
+
+
+def show_full(t, keys, extra=None, height=None):
+    keys = keys if isinstance(keys, list) else [keys]
+    cols = [c for c in FULL_COLS if c in t.columns]
+    out = t[keys + (extra or []) + cols].rename(columns=FULL_COLS)
+    fmt = {}
+    for k, v in FULL_COLS.items():
+        if k.endswith("%"):
+            fmt[v] = "{:+.1%}"
+        elif k.endswith("bps"):
+            fmt[v] = "{:+.1f}"
+        elif k.replace("YTD__", "") in RATE_KEYS:
+            fmt[v] = "{:.2%}"
+        else:
+            fmt[v] = "{:,.0f}"
+    for e in extra or []:
+        fmt[e] = "{:.1%}"
+    kw = dict(width="stretch", hide_index=True)
+    if height:
+        kw["height"] = height
+    st.dataframe(out.style.format(fmt, na_rep="-"), **kw)
+
+
 def need_card():
     if not HAS_CARD:
         st.info("Upload the Card MIS CSV in the sidebar to see this tab.")
@@ -675,11 +739,23 @@ def need_card():
 
 
 def rr_snapshot(g, cat, val_rr):
-    """From a run-rated snapshot table build an ACTUAL frame with _F for bar_rr."""
     out = g[[cat] + ([c for c in ["PF_DM_NAME"] if c in g.columns and c != cat])].copy()
     out[val_rr] = g[val_rr] / CUR_FACTOR
     out["_F"] = CUR_FACTOR
     return out
+
+
+def ytd_vs_ly_bar(t, key, title, top=15):
+    """Grouped bar: YTD CY (incl. RR month) vs YTD LY, per key."""
+    t = t.sort_values("YTD__VOLUME", ascending=False).head(top)
+    long = pd.concat([
+        pd.DataFrame({key: t[key], "Period": f"YTD {CY}" + (" (incl. RR)" if CUR_FACTOR != 1 else ""),
+                      "Volume": t["YTD__VOLUME"]}),
+        pd.DataFrame({key: t[key], "Period": f"YTD {LY}", "Volume": t["YTD__VOLUME_LY"]})])
+    fig = px.bar(long, x="Volume", y=key, color="Period", barmode="group", orientation="h", title=title,
+                 color_discrete_sequence=["#1F4E79", "#A9B8C9"])
+    return fig.update_yaxes(autorange="reversed", type="category").update_layout(
+        height=max(380, 32 * len(t)), legend_title_text="")
 
 
 # ================================================================ HEADER & TABS
@@ -693,9 +769,9 @@ st.caption(f"Reporting month: **{cur_m}** · MoM vs **{mom_m}** · YoY vs **{yoy
            + " · ".join(notes) + " · all earlier months are actuals")
 st.caption(RR_LEGEND)
 
-tab_tot, tab_yoy, tab_ovw, tab_cat, tab_mer, tab_qr = st.tabs(
+tab_tot, tab_yoy, tab_ovw, tab_cat, tab_mer, tab_pf, tab_qr = st.tabs(
     ["1 · Total Acquiring (Card + QRPH)", "2 · Card YoY & YTD", "3 · PF vs DM Overview",
-     "4 · Category Mix", "5 · Merchant Level", "6 · QRPH"])
+     "4 · Category Mix", "5 · Merchant Level", "6 · PF Level (MID → Sub-merchant)", "7 · QRPH"])
 
 card_a = None
 if HAS_CARD:
@@ -926,7 +1002,6 @@ with tab_mer:
                     show_table(subt.assign(**{"Vol Share": subt["Share of PF"]}), ["PF_DM_NAME", SUB_COL, "Vol Share"])
                     st.caption("'Vol Share' here = share of the sub-merchant within its PF.")
 
-        # ---------------- per-merchant drill-down: YoY & YTD first, then MoM
         st.divider()
         st.subheader("Merchant drill-down")
         cA, cB = st.columns(2)
@@ -942,7 +1017,6 @@ with tab_mer:
         label = pick if sub_pick == "All" else f"{pick} › {sub_pick}"
         trd_all = trend_actual(dd)
 
-        # ---- (1) YoY & YTD
         st.markdown(f"#### ① YoY & YTD – {label}")
         st.caption(f"YTD {ytd_lbl} {CY}{' (incl. run-rated ' + MON[END_MM] + ')' if CUR_FACTOR != 1 else ''} "
                    f"vs YTD {ytd_lbl} {LY} actual · FY outlook = YTD ÷ {END_MM} × 12 vs FY {LY} actual")
@@ -964,8 +1038,7 @@ with tab_mer:
             sy.loc[sy.VOLUME_LY.fillna(0) < MIN_LY_BASE, "VOLUME_YoY%"] = float("nan")
             show_ytd(sy.sort_values("VOLUME", ascending=False), SUB_COL)
 
-        # ---- (2) Month on month
-        st.markdown(f"#### ② Month on month – {label}: {cur_m}{' (RR)' if CUR_FACTOR != 1 else ''} vs {mom_m}")
+        st.markdown(f"#### ② Month on month – {label}: {cur_m}{RR_TAG} vs {mom_m}")
         kpi_row(period_table(dd.assign(ALL=label), "ALL"))
         trd = trd_all.sort_values("YEAR_MONTH")
         trd = trd[trd.YEAR_MONTH >= prev_month(cur_m, 12)]
@@ -978,7 +1051,129 @@ with tab_mer:
             st.markdown(f"**MoM – sub-merchants under {pick}**")
             show_table(period_table(dd, SUB_COL).sort_values("VOLUME", ascending=False), SUB_COL)
 
-# ================================================================ TAB 6 – QRPH
+# ================================================================ TAB 6 – PF LEVEL (MID → SUB-MERCHANT)
+with tab_pf:
+    if need_card():
+        dpf = df[df.PF_DM_TAG == "Payment Facilitator"]
+        if dpf.empty:
+            st.info("No Payment Facilitator rows in the Card MIS.")
+        else:
+            st.caption(f"Hierarchy: **PF** (PF_DM_NAME) → **MID** (CARD_ACCEPTOR_ID) → **Sub-merchant** "
+                       f"(MERCHANT_NAME_ORIG). YTD {ytd_lbl} {CY}{' incl. run-rated ' + MON[END_MM] if CUR_FACTOR != 1 else ''} "
+                       f"vs {ytd_lbl} {LY} · month {cur_m}{RR_TAG} vs {mom_m} (MoM) and {yoy_m} (YoY). "
+                       f"YoY shown as '-' where the LY base is too small.")
+
+            # ---------- (A) all PFs at a glance
+            st.subheader("All Payment Facilitators – YTD, YoY, MoM")
+            allpf = full_compare(dpf, "PF_DM_NAME").sort_values("YTD__VOLUME", ascending=False)
+            allpf["YTD Share"] = allpf.YTD__VOLUME / allpf.YTD__VOLUME.sum()
+            show_full(allpf, "PF_DM_NAME", extra=["YTD Share"], height=380)
+
+            # ---------- (B) one PF
+            st.divider()
+            pf_names = allpf.PF_DM_NAME.dropna().tolist()
+            pf = st.selectbox("Select Payment Facilitator", pf_names, key="pf_pick")
+            dp = dpf[dpf.PF_DM_NAME == pf]
+
+            st.markdown(f"#### ① {pf} – YoY & YTD")
+            ytd_kpi_block(dp, pf)
+            cur_rows = dp[dp.YEAR_MONTH == cur_m]
+            pm_rows = dp[dp.YEAR_MONTH == mom_m]
+            ly_rows = dp[dp.YEAR_MONTH == yoy_m]
+            c = st.columns(4)
+            n_mid, n_sub = cur_rows[MID_COL].nunique(), cur_rows[SUB_COL].nunique()
+            c[0].metric(f"Active MIDs ({cur_m})", f"{n_mid:,}",
+                        f"{n_mid - pm_rows[MID_COL].nunique():+,} MoM | {n_mid - ly_rows[MID_COL].nunique():+,} YoY")
+            c[1].metric(f"Active sub-merchants ({cur_m})", f"{n_sub:,}",
+                        f"{n_sub - pm_rows[SUB_COL].nunique():+,} MoM | {n_sub - ly_rows[SUB_COL].nunique():+,} YoY")
+            new_subs = set(cur_rows[SUB_COL]) - set(dp[dp.YEAR_MONTH < cur_m][SUB_COL])
+            c[2].metric(f"New sub-merchants in {cur_m}", f"{len(new_subs):,}", "first-ever transaction month",
+                        delta_color="off")
+            ytd_subs = ytd_slice(dp, CY, END_MM)[SUB_COL].nunique()
+            c[3].metric(f"Sub-merchants transacting YTD {CY}", f"{ytd_subs:,}",
+                        f"LY YTD {ytd_slice(dp, LY, END_MM)[SUB_COL].nunique():,}", delta_color="off")
+
+            tp_all = trend_actual(dp)
+            tp = year_filter(tp_all, "yr_pf")
+            c1, c2 = st.columns(2)
+            c1.plotly_chart(line_rr(tp, "MONTH", "VOLUME", f"{pf} – Monthly Volume by Year", color="YEAR",
+                                    order=ORDER_M), width="stretch")
+            c2.plotly_chart(line_rr(tp, "MONTH", "VOLUME", f"{pf} – Cumulative YTD Volume", color="YEAR",
+                                    order=ORDER_M, cum=True), width="stretch")
+            c3, c4 = st.columns(2)
+            c3.plotly_chart(yoy_bar(tp_all, f"{pf} – Monthly Volume YoY % ({CY} vs {LY})"), width="stretch")
+            c4.plotly_chart(px.line(tp, x="MONTH", y="WEIGHTED_MDR", color="YEAR", markers=True,
+                                    category_orders=ORDER_M, title=f"{pf} – Weighted MDR by Year (not run-rated)")
+                            .update_yaxes(tickformat=".2%"), width="stretch")
+
+            st.markdown(f"#### ② {pf} – Month on month: {cur_m}{RR_TAG} vs {mom_m}")
+            kpi_row(period_table(dp.assign(ALL=pf), "ALL"))
+
+            # ---------- (C) MIDs under the PF
+            st.markdown(f"#### ③ MIDs under {pf}")
+            mids = full_compare(dp, MID_COL).sort_values("YTD__VOLUME", ascending=False)
+            mids["YTD Share of PF"] = mids.YTD__VOLUME / mids.YTD__VOLUME.sum()
+            # main industry per MID for context
+            ind = (dp.groupby([MID_COL, "INDUSTRY"]).TOTAL_VOLUME.sum().reset_index()
+                     .sort_values("TOTAL_VOLUME", ascending=False).drop_duplicates(MID_COL)
+                     .rename(columns={"INDUSTRY": "Main industry"})[[MID_COL, "Main industry"]])
+            mids = mids.merge(ind, on=MID_COL, how="left")
+            show_full(mids, [MID_COL, "Main industry"], extra=["YTD Share of PF"], height=320)
+
+            tm = trend_actual(dp, MID_COL)
+            top_mids = mids[MID_COL].head(MID_TOP_N).tolist()
+            tm["MID_GRP"] = tm[MID_COL].where(tm[MID_COL].isin(top_mids), f"Other MIDs")
+            tm = year_filter(tm, "yr_pf_mid", default_last=2, label="Years shown in MID chart")
+            tm = tm.groupby(["YEAR_MONTH", "LABEL", "MID_GRP", "_F"], as_index=False).VOLUME.sum().sort_values("YEAR_MONTH")
+            c1, c2 = st.columns(2)
+            c1.plotly_chart(bar_rr(tm, "LABEL", "VOLUME", f"{pf} – Monthly Volume by MID (top {MID_TOP_N})",
+                                   color="MID_GRP"), width="stretch")
+            c2.plotly_chart(ytd_vs_ly_bar(mids, MID_COL, f"{pf} – YTD {CY} vs YTD {LY} by MID"), width="stretch")
+
+            # ---------- (D) sub-merchants under a MID
+            st.markdown(f"#### ④ Sub-merchants under each MID")
+            cA, cB = st.columns([2, 1])
+            mid_opts = ["All MIDs"] + mids[MID_COL].tolist()
+            mid_pick = cA.selectbox("MID", mid_opts, index=1 if len(mid_opts) > 1 else 0, key="pf_mid_pick",
+                                    format_func=lambda m: m if m == "All MIDs" else
+                                    f"{m} · {mids.set_index(MID_COL).loc[m, 'Main industry']} · "
+                                    f"{int(mids.set_index(MID_COL).loc[m, 'N_SUB'] or 0) if pd.notna(mids.set_index(MID_COL).loc[m, 'N_SUB']) else 0} subs")
+            rank_by = cB.radio("Rank sub-merchants by", ["YTD__VOLUME", "VOLUME"], horizontal=True, key="pf_rank",
+                               format_func=lambda x: f"YTD {CY}" if x.startswith("YTD") else f"{cur_m}{RR_TAG}")
+            dm = dp if mid_pick == "All MIDs" else dp[dp[MID_COL] == mid_pick]
+            subs = full_compare(dm, [MID_COL, SUB_COL]).sort_values(rank_by, ascending=False)
+            subs["Share of MID (YTD)"] = subs.YTD__VOLUME / subs.groupby(MID_COL).YTD__VOLUME.transform("sum")
+            subs = subs.drop(columns=["N_MID", "N_SUB"])
+
+            tmap = subs[subs.YTD__VOLUME > 0]
+            if not tmap.empty:
+                st.plotly_chart(px.treemap(tmap, path=[px.Constant(pf), MID_COL, SUB_COL], values="YTD__VOLUME",
+                                           color="YTD__VOLUME_YoY%", color_continuous_scale="RdYlGn",
+                                           color_continuous_midpoint=0, range_color=[-1, 1],
+                                           title=f"{pf} → MID → Sub-merchant · size = YTD {CY} volume, "
+                                                 f"colour = YTD YoY % (grey = new / n.m.)")
+                                .update_traces(texttemplate="%{label}<br>%{percentParent:.1%}")
+                                .update_layout(height=560, margin=dict(t=50, l=5, r=5, b=5)), width="stretch")
+            top_s = st.slider("Top N sub-merchants", 5, 40, 15, key="pf_sub_n")
+            ts = subs.head(top_s)
+            c1, c2 = st.columns(2)
+            c1.plotly_chart(bar_rr(rr_snapshot(ts.rename(columns={}), SUB_COL, "VOLUME"), SUB_COL, "VOLUME",
+                                   f"Top {top_s} sub-merchants – {cur_m} volume", horizontal=True,
+                                   height=max(400, 30 * len(ts))), width="stretch")
+            c2.plotly_chart(ytd_vs_ly_bar(ts.drop_duplicates(SUB_COL), SUB_COL,
+                                          f"Top {top_s} sub-merchants – YTD {CY} vs YTD {LY}", top=top_s), width="stretch")
+            show_full(subs, [MID_COL, SUB_COL], extra=["Share of MID (YTD)"], height=420)
+
+            # ---------- (E) single sub-merchant trend
+            sub_pick = st.selectbox("Sub-merchant trend", subs[SUB_COL].drop_duplicates().tolist(), key="pf_sub_pick")
+            ds = dm[dm[SUB_COL] == sub_pick]
+            ytd_kpi_block(ds, sub_pick)
+            ts_tr = trend_actual(ds).sort_values("YEAR_MONTH")
+            ts_tr = ts_tr[ts_tr.YEAR_MONTH >= prev_month(cur_m, 12)]
+            st.plotly_chart(bar_rr(ts_tr, "LABEL", "VOLUME", f"{sub_pick} – Monthly Volume (last 13 months)"),
+                            width="stretch")
+
+# ================================================================ TAB 7 – QRPH
 with tab_qr:
     if not HAS_QR:
         st.info("Upload the QRPH sheet in the sidebar (needs YEAR_MONTH, VOLUME_POSTED, TXN_COUNT_POSTED).")
