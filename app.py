@@ -5,17 +5,18 @@ Requirements: streamlit>=1.50, pandas, plotly, openpyxl
 
 Data sources - found automatically in the repo (root, data/, data/qrph/, data/card/) by COLUMN HEADERS,
 or uploaded in the sidebar (also auto-detected):
-  * Card MIS : YEAR_MONTH, [MAX_TRAN_DATE -> auto as-of date for run-rate], PF_DM_TAG, PF_DM_NAME, MERCHANT_NAME_ORIG, CARD_ACCEPTOR_ID (MID), INDUSTRY, TRXN_CODE,
-               TOTAL_VOLUME, TOTAL_COUNT, MDR, INTERCHANGE_RATE, INTERCHANGE_EXPENSE_PHP
+  * Card MIS : YEAR_MONTH, [MAX_TRAN_DATE -> automatic as-of date for the run-rate], PF_DM_TAG, PF_DM_NAME,
+               MERCHANT_NAME_ORIG, CARD_ACCEPTOR_ID (MID), INDUSTRY, TRXN_CODE, TOTAL_VOLUME, TOTAL_COUNT, MDR,
+               INTERCHANGE_RATE, INTERCHANGE_EXPENSE_PHP
   * QRPH     : YEAR_MONTH, VOLUME_POSTED, TXN_COUNT_POSTED (other columns ignored)
 
 Run-rate rule (per source): ONLY each source's latest month is run-rated (MTD x days / as-of day).
+  Card as-of day = latest MAX_TRAN_DATE within the latest YEAR_MONTH (read from the file; can be overridden).
 Every prior month (incl. MoM / YoY / YTD LY bases) = actual, simple summation.
 
 Chart convention for the run-rated month:
   * Bars : solid = MTD actual, hatched lighter segment on top = run-rate uplift, label "RR ₱x" = full run-rate
   * Lines: solid line = actuals, dotted line + ★ = run-rate, open circle = MTD actual
-
 Rate charts (MDR / interchange): y-axis spans at least RATE_MIN_SPAN_BPS so sub-bp noise doesn't look like movement.
 """
 import calendar
@@ -26,12 +27,11 @@ from datetime import date
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+from streamlit.delta_generator import DeltaGenerator as _DG
 
 st.set_page_config(page_title="Merchant Acquiring Dashboard", layout="wide")
 
-# Give every chart a unique key so identical charts on different tabs (e.g. the same PF in tab 5 and tab 6)
-# don't raise StreamlitDuplicateElementId. Counter restarts every rerun, so keys stay stable.
-from streamlit.delta_generator import DeltaGenerator as _DG  # noqa: E402
+# unique key for every chart (avoids StreamlitDuplicateElementId when identical charts appear on two tabs)
 _orig_plotly_chart = _DG.plotly_chart
 _CHART_N = [0]
 
@@ -55,10 +55,11 @@ CAT_TOP_N = 10
 MID_TOP_N = 8
 OTHERS_LABEL = "Others"
 MIN_LY_BASE = 1_000_000
-RATE_MIN_SPAN_BPS = 20            # rate charts: y-axis always covers >= 20 bps
+RATE_MIN_SPAN_BPS = 20
 CARD_REQUIRED = ["YEAR_MONTH", "PF_DM_TAG", "PF_DM_NAME", "INDUSTRY", "TRXN_CODE", "TOTAL_VOLUME",
                  "TOTAL_COUNT", "MDR", "INTERCHANGE_RATE", "INTERCHANGE_EXPENSE_PHP"]
 QRPH_REQUIRED = ["YEAR_MONTH", "VOLUME_POSTED", "TXN_COUNT_POSTED"]
+DATE_COL = "MAX_TRAN_DATE"
 SUB_COL = "MERCHANT_NAME_ORIG"
 MID_COL = "MID"
 MON = calendar.month_abbr
@@ -111,7 +112,7 @@ def _read_any(src, name):
             skip = _header_row(lines)
             sep = max(SEPS, key=(lines[skip] if lines else "").count)
             return pd.read_csv(src, encoding=enc, low_memory=False, sep=sep, skiprows=skip,
-                               dtype={"CARD_ACCEPTOR_ID": str})
+                               dtype={"CARD_ACCEPTOR_ID": str, "MAX_TRAN_DATE": str})
         except UnicodeDecodeError:
             continue
     raise ValueError(f"{name}: could not decode file")
@@ -134,6 +135,25 @@ def _norm_mid(s):
     return s.replace({"nan": "NO MID", "": "NO MID", "None": "NO MID"})
 
 
+def _parse_dates(s):
+    """Robust date parser: 2024-01-31 / 2024-01-31 00:00:00 / 1/31/2024 / 31-Jan-2024 / Excel serial 45322."""
+    if pd.api.types.is_datetime64_any_dtype(s):
+        return s
+    raw = s.astype(str).str.strip().replace({"": None, "nan": None, "NaT": None, "None": None})
+    out = pd.to_datetime(raw.str[:10], format="%Y-%m-%d", errors="coerce")          # ISO first
+    for fmt in ("%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d", "%d-%b-%Y", "%d-%b-%y", "%m/%d/%y"):
+        miss = out.isna() & raw.notna()
+        if not miss.any():
+            break
+        out = out.fillna(pd.to_datetime(raw.where(miss).str.split(" ").str[0], format=fmt, errors="coerce"))
+    miss = out.isna() & raw.notna()
+    if miss.any():                                                                   # Excel serial numbers
+        num = pd.to_numeric(raw.where(miss), errors="coerce")
+        ser = pd.to_datetime(num.where(num.between(20000, 80000)), unit="D", origin="1899-12-30", errors="coerce")
+        out = out.fillna(ser)
+    return out
+
+
 @st.cache_data(show_spinner="Loading files…")
 def load_sources(files):
     card, qr, log = [], [], []
@@ -143,7 +163,8 @@ def load_sources(files):
         kind = classify(d.columns)
         if kind == "card":
             card.append(d)
-            log.append(f"✅ **{name}** → Card MIS")
+            log.append(f"✅ **{name}** → Card MIS" + (f" (has {DATE_COL})" if DATE_COL in d.columns
+                                                       else f" (⚠️ no {DATE_COL} column)"))
         elif kind == "qrph":
             qr.append(d)
             log.append(f"✅ **{name}** → QRPH")
@@ -160,9 +181,8 @@ def load_sources(files):
             cdf[SUB_COL] = cdf["PF_DM_NAME"]
         cdf[SUB_COL] = cdf[SUB_COL].fillna("UNTAGGED").astype(str).str.strip()
         cdf[MID_COL] = _norm_mid(cdf["CARD_ACCEPTOR_ID"]) if "CARD_ACCEPTOR_ID" in cdf.columns else "NO MID"
-        if "MAX_TRAN_DATE" in cdf.columns:                     # optional: latest tran date per row
-            cdf["MAX_TRAN_DATE"] = pd.to_datetime(cdf["MAX_TRAN_DATE"].astype(str).str.strip(),
-                                                  errors="coerce", format="mixed")
+        if DATE_COL in cdf.columns:
+            cdf[DATE_COL] = _parse_dates(cdf[DATE_COL])
         cdf["MDR_X_VOL"] = cdf["MDR"] * cdf["TOTAL_VOLUME"]
         cdf["IC_X_VOL"] = cdf["INTERCHANGE_RATE"] * cdf["TOTAL_VOLUME"]
         cdf["INTERCHANGE_PHP"] = -cdf["INTERCHANGE_EXPENSE_PHP"]
@@ -196,7 +216,10 @@ def _sniff_header(path):
 
 @st.cache_data(ttl=300)
 def scan_repo():
-    found, allf = {}, []
+    """Classify every csv/xlsx by header. Returns {'card': [paths best-first], 'qrph': [...], '_all': [...]}.
+    Card files WITH a MAX_TRAN_DATE column rank first (git clones give all files the same timestamp,
+    so modification time alone can't tell old from new)."""
+    found, allf = {"card": [], "qrph": []}, []
     for d in SCAN_DIRS:
         if not os.path.isdir(d):
             continue
@@ -205,13 +228,15 @@ def scan_repo():
             if not f.lower().endswith((".csv", ".xlsx", ".xls")) or f.startswith("~$") or p in [a[0] for a in allf]:
                 continue
             try:
-                hdr = _sniff_header(p)
+                hdr = [_clean_col(h) for h in _sniff_header(p)]
                 kind = classify(hdr)
             except Exception as e:
                 hdr, kind = [f"read error: {e}"], None
-            allf.append((p, kind, [_clean_col(h) for h in hdr][:12]))
-            if kind and (kind not in found or os.path.getmtime(p) > os.path.getmtime(found[kind])):
-                found[kind] = p
+            allf.append((p, kind, hdr[:12], DATE_COL in hdr))
+            if kind:
+                found[kind].append((p, DATE_COL in hdr, os.path.getmtime(p)))
+    for k in ("card", "qrph"):
+        found[k] = [p for p, has_dt, mt in sorted(found[k], key=lambda x: (x[1], x[2]), reverse=True)]
     found["_all"] = allf
     return found
 
@@ -297,10 +322,8 @@ def month_picker_date(label, ym, default_day, key):
     return dim / d.day, d
 
 
-# ================================================================ RATE CHARTS (MDR / interchange)
+# ================================================================ RATE CHARTS
 def rate_line(d, x, y, title, color=None, order=None, cmap=None):
-    """Line chart for rates. Values rounded to 0.01 bp; y-axis spans >= RATE_MIN_SPAN_BPS so a flat rate
-    (e.g. 70 bps every month) plots flat instead of zooming into floating-point / refund-mix noise."""
     ys = y if isinstance(y, list) else [y]
     d = d.copy()
     for c in ys:
@@ -440,13 +463,24 @@ for u in uploads or []:
         pass
     u.seek(0)
 repo_found = scan_repo()
-for kind in ("card", "qrph"):
-    if kind not in up_kinds and kind in repo_found:
-        files.append((repo_found[kind], repo_found[kind]))
-with st.sidebar.expander("Repo files detected", expanded="qrph" not in repo_found or "card" not in repo_found):
-    for p, k, hdr in repo_found.get("_all", []):
+
+if "card" not in up_kinds and repo_found["card"]:
+    cands = repo_found["card"]
+    if len(cands) > 1:
+        card_file = st.sidebar.selectbox(
+            "Card MIS file to use", cands, index=0, key="card_file",
+            help=f"Several card files found in the repo. Files with a {DATE_COL} column are listed first.")
+    else:
+        card_file = cands[0]
+    files.append((card_file, card_file))
+if "qrph" not in up_kinds and repo_found["qrph"]:
+    files.append((repo_found["qrph"][0], repo_found["qrph"][0]))
+
+with st.sidebar.expander("Repo files detected", expanded=not repo_found["card"] or not repo_found["qrph"]):
+    for p, k, hdr, has_dt in repo_found.get("_all", []):
         if k:
-            st.caption(f"✅ `{p}` → {k}")
+            st.caption(f"✅ `{p}` → {k}" + (f" · {DATE_COL} ✔" if k == "card" and has_dt else
+                                            f" · no {DATE_COL}" if k == "card" else ""))
         else:
             st.caption(f"⚠️ `{p}` → not recognised. Header read: `{', '.join(hdr) or '(empty)'}`")
     if not repo_found.get("_all"):
@@ -471,24 +505,30 @@ if not HAS_CARD:
 if not HAS_QR:
     st.sidebar.warning("No QRPH sheet loaded – QRPH figures will be empty.")
 
+
 def data_max_tran_date(d, ym):
-    """Latest MAX_TRAN_DATE among rows of month `ym` (clipped to that month). None if column missing/empty."""
-    if "MAX_TRAN_DATE" not in d.columns:
-        return None
+    """(date or None, reason). Latest MAX_TRAN_DATE among rows of month `ym`, clipped to that month."""
+    if DATE_COL not in d.columns:
+        return None, f"the loaded card file has no {DATE_COL} column"
+    s_all = d.loc[d["YEAR_MONTH"] == ym, DATE_COL]
+    s = s_all.dropna()
+    if s.empty:
+        return None, f"{DATE_COL} is blank / unreadable for {ym} ({len(s_all):,} rows)"
     p = pd.Period(ym, "M")
-    s = d.loc[d["YEAR_MONTH"] == ym, "MAX_TRAN_DATE"].dropna()
-    s = s[(s >= p.start_time) & (s <= p.end_time)]
-    return s.max().date() if not s.empty else None
+    s_in = s[(s >= p.start_time) & (s <= p.end_time)]
+    if s_in.empty:
+        return None, f"{DATE_COL} values for {ym} fall outside that month (e.g. {s.max():%Y-%m-%d})"
+    return s_in.max().date(), None
 
 
 LATEST_M, RR_FACTOR, card_asof = None, 1.0, None
 if HAS_CARD:
     LATEST_M = card_raw["YEAR_MONTH"].max()
-    auto_dt = data_max_tran_date(card_raw, LATEST_M)
     lp_ = pd.Period(LATEST_M, "M")
     dim_ = calendar.monthrange(lp_.year, lp_.month)[1]
+    auto_dt, why = data_max_tran_date(card_raw, LATEST_M)
     if auto_dt is not None:
-        override = st.sidebar.checkbox(f"Override card as-of date (data says {auto_dt:%b %d, %Y})",
+        override = st.sidebar.checkbox(f"Override card as-of date (file says {auto_dt:%b %d, %Y})",
                                        value=False, key="asof_override")
         if override:
             RR_FACTOR, card_asof = month_picker_date(f"Card data as of ({LATEST_M})", LATEST_M, auto_dt.day,
@@ -496,13 +536,18 @@ if HAS_CARD:
         else:
             card_asof = auto_dt
             RR_FACTOR = dim_ / auto_dt.day
-            st.sidebar.caption(f"Card data as of **{auto_dt:%b %d, %Y}** (max MAX_TRAN_DATE in {LATEST_M}, "
-                               f"read from file)")
+            st.sidebar.caption(f"Card data as of **{auto_dt:%b %d, %Y}** – latest {DATE_COL} in {LATEST_M}")
     else:
-        st.sidebar.caption("No MAX_TRAN_DATE column found – set the as-of date manually.")
+        st.sidebar.warning(f"Couldn't read the as-of date automatically: {why}. Set it manually.")
         RR_FACTOR, card_asof = month_picker_date(f"Card data as of ({LATEST_M})", LATEST_M, 14, "asof_card")
     st.sidebar.caption(f"Card run-rate ({LATEST_M} only): {dim_} / {card_asof.day} = **{RR_FACTOR:.3f}x**"
                        + (" (full month – no run-rate)" if RR_FACTOR == 1 else ""))
+    if DATE_COL in card_raw.columns:
+        with st.sidebar.expander(f"{DATE_COL} by month"):
+            mx = (card_raw.groupby("YEAR_MONTH")[DATE_COL].max().dropna().sort_index(ascending=False)
+                  .dt.strftime("%Y-%m-%d").rename("Max tran date").to_frame())
+            st.dataframe(mx, width="stretch", height=240)
+
 QR_LATEST, QR_RR = None, 1.0
 if HAS_QR:
     QR_LATEST = qr["YEAR_MONTH"].max()
@@ -513,7 +558,8 @@ if HAS_QR:
         dflt = max(_t.day - 1, 1)
     else:
         dflt = 31
-    QR_RR, _ = month_picker_date(f"QRPH data as of ({QR_LATEST})", QR_LATEST, dflt, "asof_qr")
+    QR_RR, _ = month_picker_date(f"QRPH data as of ({QR_LATEST})", QR_LATEST, dflt,
+                                 f"asof_qr_{dflt}")                      # key tracks card date so it follows it
     st.sidebar.caption(f"QRPH run-rate ({QR_LATEST} only): **{QR_RR:.3f}x**")
 
 st.sidebar.divider()
@@ -830,7 +876,7 @@ def ytd_vs_ly_bar(t, key, title, top=15):
 st.title("Merchant Acquiring Dashboard")
 notes = []
 if HAS_CARD:
-    notes.append(f"Card: {LATEST_M} run-rated ×{RR_FACTOR:.2f}")
+    notes.append(f"Card: {LATEST_M} as of {card_asof:%b %d}, run-rated ×{RR_FACTOR:.2f}")
 if HAS_QR:
     notes.append(f"QRPH: {QR_LATEST} run-rated ×{QR_RR:.2f}")
 st.caption(f"Reporting month: **{cur_m}** · MoM vs **{mom_m}** · YoY vs **{yoy_m}** · YTD {ytd_lbl} · "
@@ -938,7 +984,6 @@ with tab_yoy:
                    f"FY outlook = YTD ÷ {END_MM} × 12.")
         st.subheader(f"YTD {ytd_lbl}: {CY} vs {LY}")
         ytd_kpi_block(d4, "Total")
-
         m_all = trend_actual(d4)
         m = year_filter(m_all, "yr_tab4")
         c1, c2 = st.columns(2)
@@ -1003,7 +1048,6 @@ with tab_cat:
         c1, c2 = st.columns(2)
         c1.plotly_chart(pie(top_n_others(cat, "VOLUME"), "VOLUME", f"Volume Share – {seg_pick} – {cur_m}{rr_t}"), width="stretch")
         c2.plotly_chart(pie(top_n_others(cat, "TXN_COUNT"), "TXN_COUNT", f"Txn Count Share – {seg_pick} – {cur_m}{rr_t}"), width="stretch")
-
         top = cat.loc[cat.INDUSTRY != OTHERS_LABEL, "INDUSTRY"].head(CAT_TOP_N).tolist()
         tr2 = year_filter(trend_actual(d2, "INDUSTRY"), "yr_cat", default_last=2)
         tr2["CAT"] = tr2.INDUSTRY.where(tr2.INDUSTRY.isin(top), OTHERS_LABEL)
@@ -1019,7 +1063,7 @@ with tab_cat:
                                title=f"Volume Share Change vs {mom_m} (pp)").update_yaxes(autorange="reversed"), width="stretch")
         show_table(cat.assign(**{"Vol Share": cat.VOL_SHARE}), ["INDUSTRY", "Vol Share"])
 
-# ================================================================ TAB 5 – MERCHANT LEVEL (+ PF sub-merchants)
+# ================================================================ TAB 5 – MERCHANT LEVEL
 with tab_mer:
     if need_card():
         seg3 = st.radio("Segment", ["Payment Facilitator", "Direct Merchant"], horizontal=True, key="m_seg")
@@ -1081,7 +1125,6 @@ with tab_mer:
                 dd = dd[dd[SUB_COL] == sub_pick]
         label = pick if sub_pick == "All" else f"{pick} › {sub_pick}"
         trd_all = trend_actual(dd)
-
         st.markdown(f"#### ① YoY & YTD – {label}")
         st.caption(f"YTD {ytd_lbl} {CY}{' (incl. run-rated ' + MON[END_MM] + ')' if CUR_FACTOR != 1 else ''} "
                    f"vs YTD {ytd_lbl} {LY} actual · FY outlook = YTD ÷ {END_MM} × 12 vs FY {LY} actual")
@@ -1101,7 +1144,6 @@ with tab_mer:
             sy = ytd_compare(dd, SUB_COL)
             sy.loc[sy.VOLUME_LY.fillna(0) < MIN_LY_BASE, "VOLUME_YoY%"] = float("nan")
             show_ytd(sy.sort_values("VOLUME", ascending=False), SUB_COL)
-
         st.markdown(f"#### ② Month on month – {label}: {cur_m}{RR_TAG} vs {mom_m}")
         kpi_row(period_table(dd.assign(ALL=label), "ALL"))
         trd = trd_all.sort_values("YEAR_MONTH")
@@ -1125,22 +1167,17 @@ with tab_pf:
                        f"(MERCHANT_NAME_ORIG). YTD {ytd_lbl} {CY}{' incl. run-rated ' + MON[END_MM] if CUR_FACTOR != 1 else ''} "
                        f"vs {ytd_lbl} {LY} · month {cur_m}{RR_TAG} vs {mom_m} (MoM) and {yoy_m} (YoY). "
                        f"YoY shown as '-' where the LY base is too small.")
-
             st.subheader("All Payment Facilitators – YTD, YoY, MoM")
             allpf = full_compare(dpf, "PF_DM_NAME").sort_values("YTD__VOLUME", ascending=False)
             allpf["YTD Share"] = allpf.YTD__VOLUME / allpf.YTD__VOLUME.sum()
             show_full(allpf, "PF_DM_NAME", extra=["YTD Share"], height=380)
 
             st.divider()
-            pf_names = allpf.PF_DM_NAME.dropna().tolist()
-            pf = st.selectbox("Select Payment Facilitator", pf_names, key="pf_pick")
+            pf = st.selectbox("Select Payment Facilitator", allpf.PF_DM_NAME.dropna().tolist(), key="pf_pick")
             dp = dpf[dpf.PF_DM_NAME == pf]
-
             st.markdown(f"#### ① {pf} – YoY & YTD")
             ytd_kpi_block(dp, pf)
-            cur_rows = dp[dp.YEAR_MONTH == cur_m]
-            pm_rows = dp[dp.YEAR_MONTH == mom_m]
-            ly_rows = dp[dp.YEAR_MONTH == yoy_m]
+            cur_rows, pm_rows, ly_rows = dp[dp.YEAR_MONTH == cur_m], dp[dp.YEAR_MONTH == mom_m], dp[dp.YEAR_MONTH == yoy_m]
             c = st.columns(4)
             n_mid, n_sub = cur_rows[MID_COL].nunique(), cur_rows[SUB_COL].nunique()
             c[0].metric(f"Active MIDs ({cur_m})", f"{n_mid:,}",
@@ -1150,10 +1187,8 @@ with tab_pf:
             new_subs = set(cur_rows[SUB_COL]) - set(dp[dp.YEAR_MONTH < cur_m][SUB_COL])
             c[2].metric(f"New sub-merchants in {cur_m}", f"{len(new_subs):,}", "first-ever transaction month",
                         delta_color="off")
-            ytd_subs = ytd_slice(dp, CY, END_MM)[SUB_COL].nunique()
-            c[3].metric(f"Sub-merchants transacting YTD {CY}", f"{ytd_subs:,}",
+            c[3].metric(f"Sub-merchants transacting YTD {CY}", f"{ytd_slice(dp, CY, END_MM)[SUB_COL].nunique():,}",
                         f"LY YTD {ytd_slice(dp, LY, END_MM)[SUB_COL].nunique():,}", delta_color="off")
-
             tp_all = trend_actual(dp)
             tp = year_filter(tp_all, "yr_pf")
             c1, c2 = st.columns(2)
@@ -1165,7 +1200,6 @@ with tab_pf:
             c3.plotly_chart(yoy_bar(tp_all, f"{pf} – Monthly Volume YoY % ({CY} vs {LY})"), width="stretch")
             c4.plotly_chart(rate_line(tp, "MONTH", "WEIGHTED_MDR", f"{pf} – Weighted MDR by Year (not run-rated)",
                                       color="YEAR", order=ORDER_M), width="stretch")
-
             st.markdown(f"#### ② {pf} – Month on month: {cur_m}{RR_TAG} vs {mom_m}")
             kpi_row(period_table(dp.assign(ALL=pf), "ALL"))
 
@@ -1177,7 +1211,6 @@ with tab_pf:
                      .rename(columns={"INDUSTRY": "Main industry"})[[MID_COL, "Main industry"]])
             mids = mids.merge(ind, on=MID_COL, how="left")
             show_full(mids, [MID_COL, "Main industry"], extra=["YTD Share of PF"], height=320)
-
             tm = trend_actual(dp, MID_COL)
             top_mids = mids[MID_COL].head(MID_TOP_N).tolist()
             tm["MID_GRP"] = tm[MID_COL].where(tm[MID_COL].isin(top_mids), "Other MIDs")
@@ -1208,7 +1241,6 @@ with tab_pf:
             subs = full_compare(dm, [MID_COL, SUB_COL]).sort_values(rank_by, ascending=False)
             subs["Share of MID (YTD)"] = subs.YTD__VOLUME / subs.groupby(MID_COL).YTD__VOLUME.transform("sum")
             subs = subs.drop(columns=["N_MID", "N_SUB"])
-
             tmap = subs[subs.YTD__VOLUME > 0]
             if not tmap.empty:
                 st.plotly_chart(px.treemap(tmap, path=[px.Constant(pf), MID_COL, SUB_COL], values="YTD__VOLUME",
@@ -1227,17 +1259,16 @@ with tab_pf:
             c2.plotly_chart(ytd_vs_ly_bar(ts.drop_duplicates(SUB_COL), SUB_COL,
                                           f"Top {top_s} sub-merchants – YTD {CY} vs YTD {LY}", top=top_s), width="stretch")
             show_full(subs, [MID_COL, SUB_COL], extra=["Share of MID (YTD)"], height=420)
-
-            sub_pick = st.selectbox("Sub-merchant trend", subs[SUB_COL].drop_duplicates().tolist(), key="pf_sub_pick")
-            ds = dm[dm[SUB_COL] == sub_pick]
-            ytd_kpi_block(ds, sub_pick)
+            sub_pick2 = st.selectbox("Sub-merchant trend", subs[SUB_COL].drop_duplicates().tolist(), key="pf_sub_pick")
+            ds = dm[dm[SUB_COL] == sub_pick2]
+            ytd_kpi_block(ds, sub_pick2)
             ts_tr = trend_actual(ds).sort_values("YEAR_MONTH")
             ts_tr = ts_tr[ts_tr.YEAR_MONTH >= prev_month(cur_m, 12)]
             c1, c2 = st.columns(2)
-            c1.plotly_chart(bar_rr(ts_tr, "LABEL", "VOLUME", f"{sub_pick} – Monthly Volume (last 13 months)"),
+            c1.plotly_chart(bar_rr(ts_tr, "LABEL", "VOLUME", f"{sub_pick2} – Monthly Volume (last 13 months)"),
                             width="stretch")
             c2.plotly_chart(rate_line(ts_tr, "LABEL", ["WEIGHTED_MDR", "WEIGHTED_IC"],
-                                      f"{sub_pick} – Weighted MDR vs Interchange (not run-rated)"), width="stretch")
+                                      f"{sub_pick2} – Weighted MDR vs Interchange (not run-rated)"), width="stretch")
 
 # ================================================================ TAB 7 – QRPH
 with tab_qr:
