@@ -1,10 +1,12 @@
 """
-Merchant Acquiring – Profitability Map (separate Streamlit app, own resource limit)
+Merchant Acquiring – Profitability (separate Streamlit app, own resource limit)
 Run: streamlit run profit_app.py      Deploy: same repo, main file path = profit_app.py
 Requirements: streamlit>=1.50, pandas, plotly, openpyxl
 
-Basis: net MDR revenue = Σ(MDR × volume) − Σ(interchange rate × volume), actuals (not run-rated).
-Reads the same Card MIS file as app.py (auto-detected in the repo by column headers, or uploaded).
+Sections (only the selected one is computed):
+  ① Profitability Map   – net MDR revenue = Σ(MDR × volume) − Σ(interchange × volume), quadrants
+  ② Repricing Simulator – reprice a selection, assume volume loss, see Δ revenue + break-even volume loss
+  ③ Minimum MDR Floor   – floor = interchange + required spread (+ per-txn cost ÷ ticket), by industry / MCC / ticket
 """
 import calendar
 import os
@@ -17,7 +19,7 @@ import plotly.express as px
 import streamlit as st
 from streamlit.delta_generator import DeltaGenerator as _DG
 
-st.set_page_config(page_title="MA Profitability Map", layout="wide")
+st.set_page_config(page_title="MA Profitability", layout="wide")
 
 _orig_plotly_chart = _DG.plotly_chart
 _CHART_N = [0]
@@ -32,35 +34,22 @@ def _plotly_chart_keyed(self, fig, *args, **kwargs):
 
 _DG.plotly_chart = _plotly_chart_keyed
 
-SCAN_DIRS = [".", "data", "data/qrph", "data/card"]
-TAG_COLORS = {"Direct Merchant": "#F28C28", "Payment Facilitator": "#1F4E79"}
-SRC_COLORS = {"Card (PF + DM)": "#1F4E79", "QRPH": "#2E8B57"}
+SCAN_DIRS = [".", "data", "data/card"]
 RR_COLOR = "#E8541E"
-BASIS_ORDER = ["Actual", "Actual (MTD)", "Run-rate uplift"]
-FLOW_COLS = ["VOLUME", "TXN_COUNT", "INTERCHANGE_PHP"]
-CAT_TOP_N = 10
-MID_TOP_N = 8
-OTHERS_LABEL = "Others"
-MIN_LY_BASE = 1_000_000
-RATE_MIN_SPAN_BPS = 20
 CARD_REQUIRED = ["YEAR_MONTH", "PF_DM_TAG", "PF_DM_NAME", "INDUSTRY", "TRXN_CODE", "TOTAL_VOLUME",
                  "TOTAL_COUNT", "MDR", "INTERCHANGE_RATE", "INTERCHANGE_EXPENSE_PHP"]
 QRPH_REQUIRED = ["YEAR_MONTH", "VOLUME_POSTED", "TXN_COUNT_POSTED"]
 DATE_COL = "MAX_TRAN_DATE"
 SUB_COL = "MERCHANT_NAME_ORIG"
 MID_COL = "MID"
-MON = calendar.month_abbr
-RR_LEGEND = ("Run-rated month: **solid** = MTD actual, **hatched / dotted ★** = run-rate, "
-             "**open ○** = MTD actual point. Ratios (MDR, interchange rate, ticket size) are not run-rated.")
 SEPS = [",", ";", "\t", "|"]
-# Only these columns are read from the files – everything else (expense lines, NET_INCOME, etc.) is skipped
-KEEP_COLS = set(CARD_REQUIRED + QRPH_REQUIRED + [DATE_COL, SUB_COL, "CARD_ACCEPTOR_ID"])
-AGG_KEYS = ["YEAR_MONTH", "PF_DM_TAG", "PF_DM_NAME", SUB_COL, MID_COL, "INDUSTRY", "TRXN_CODE"]
+KEEP_COLS = set(CARD_REQUIRED + [DATE_COL, SUB_COL, "CARD_ACCEPTOR_ID", "MCC"])
+AGG_KEYS = ["YEAR_MONTH", "PF_DM_TAG", "PF_DM_NAME", SUB_COL, MID_COL, "INDUSTRY", "MCC", "TRXN_CODE"]
+MAIN_APP_URL = ""          # optional: paste the main dashboard URL to show a link back in the sidebar
 QUAD_COLORS = {"① Protect – high volume, above hurdle": "#2E8B57",
                "② Fix – high volume, below hurdle": "#C0392B",
                "③ Grow – low volume, above hurdle": "#2F80ED",
                "④ Review – low volume, below hurdle": "#F2994A"}
-MAIN_APP_URL = ""          # optional: paste the main dashboard URL to show a link back in the sidebar
 
 
 # ================================================================ LOADING
@@ -174,14 +163,14 @@ def load_sources(files):
             cdf[c] = pd.to_numeric(cdf[c].astype(str).str.replace(",", ""), errors="coerce").fillna(0)
         if SUB_COL not in cdf.columns:
             cdf[SUB_COL] = cdf["PF_DM_NAME"]
-        cdf[SUB_COL] = cdf[SUB_COL].fillna("UNTAGGED").astype(str).str.strip()
         cdf[MID_COL] = _norm_mid(cdf["CARD_ACCEPTOR_ID"]) if "CARD_ACCEPTOR_ID" in cdf.columns else "NO MID"
         if DATE_COL in cdf.columns:
             cdf[DATE_COL] = _parse_dates(cdf[DATE_COL])
         cdf["MDR_X_VOL"] = cdf["MDR"] * cdf["TOTAL_VOLUME"]
         cdf["IC_X_VOL"] = cdf["INTERCHANGE_RATE"] * cdf["TOTAL_VOLUME"]
         cdf["INTERCHANGE_PHP"] = -cdf["INTERCHANGE_EXPENSE_PHP"]
-        # pre-aggregate to one row per month × segment × merchant × sub-merchant × MID × industry × txn code
+        cdf["MCC"] = (cdf["MCC"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+                      if "MCC" in cdf.columns else "N/A")
         cdf = cdf.dropna(subset=["YEAR_MONTH"])
         for k in AGG_KEYS[1:]:
             cdf[k] = cdf[k].fillna("UNTAGGED").astype(str).str.strip()
@@ -208,7 +197,7 @@ def load_sources(files):
 
 def _sniff_header(path):
     if path.lower().endswith((".xlsx", ".xls")):
-        return list(_read_any(path, path).columns)
+        return list(_read_any(path, path, nrows=5).columns)
     for enc in ("utf-8-sig", "cp1252"):
         try:
             with open(path, encoding=enc) as fh:
@@ -244,7 +233,6 @@ def scan_repo():
     return found
 
 
-# ================================================================ HELPERS
 def prev_month(ym, n=1):
     return str(pd.Period(ym, "M") - n)
 
@@ -262,58 +250,70 @@ def safe_div(a, b):
     return a / b if pd.notna(a) and pd.notna(b) and b != 0 else float("nan")
 
 
-def month_picker_date(label, ym, default_day, key):
+def data_max_tran_date(d, ym):
+    if DATE_COL not in d.columns:
+        return None, f"the loaded card file has no {DATE_COL} column"
+    s_all = d.loc[d["YEAR_MONTH"] == ym, DATE_COL]
+    s = s_all.dropna()
+    if s.empty:
+        return None, f"{DATE_COL} is blank / unreadable for {ym}"
     p = pd.Period(ym, "M")
-    dim = calendar.monthrange(p.year, p.month)[1]
-    d = st.sidebar.date_input(label, value=date(p.year, p.month, min(default_day, dim)),
-                              min_value=date(p.year, p.month, 1), max_value=date(p.year, p.month, dim), key=key)
-    return dim / d.day, d
+    s_in = s[(s >= p.start_time) & (s <= p.end_time)]
+    if s_in.empty:
+        return None, f"{DATE_COL} values for {ym} fall outside that month (e.g. {s.max():%Y-%m-%d})"
+    return s_in.max().date(), None
+
+# ================================================================ PROFIT-APP HELPERS
+def fmt_bp(x):
+    return "-" if pd.isna(x) else f"{x:+.1f} bps"
 
 
-def rate_line(d, x, y, title, color=None, order=None, cmap=None):
-    ys = y if isinstance(y, list) else [y]
-    d = d.copy()
-    for c in ys:
-        d[c] = d[c].round(6)
-    fig = px.line(d, x=x, y=y, color=color, markers=True, title=title, category_orders=order or {},
-                  color_discrete_map=cmap or {})
-    vals = pd.concat([d[c] for c in ys]).dropna()
-    vals = vals[vals.between(-1, 1)]
-    if not vals.empty:
-        lo, hi = vals.min(), vals.max()
-        span = max(hi - lo, RATE_MIN_SPAN_BPS / 1e4)
-        mid = (lo + hi) / 2
-        pad = span * 0.15
-        fig.update_yaxes(range=[mid - span / 2 - pad, mid + span / 2 + pad])
-    fig.update_yaxes(tickformat=".2%", title=None)
-    fig.update_xaxes(type="category")
-    fig.update_traces(hovertemplate="%{x}<br>%{y:.3%}<extra>%{fullData.name}</extra>")
-    fig.update_layout(legend_title_text="")
-    return fig
+def months_eq(month_list):
+    """Months in the period; the latest month counts as as-of day ÷ days-in-month when it is partial."""
+    n = float(len(month_list))
+    if LATEST_M in month_list and PARTIAL:
+        n -= 1 - card_asof.day / DIM_LATEST
+    return n
 
 
-def ytd_slice(d, year, end_mm):
-    ym = d["YEAR_MONTH"]
-    return d[(ym.str[:4] == str(year)) & (ym.str[5:7].astype(int) <= end_mm)]
+def period_rows(per):
+    ym = df["YEAR_MONTH"]
+    if per == "YTD":
+        mlist = [m for m in MONTHS if m[:4] == str(CY) and m <= cur_m]
+    elif per == "L12M":
+        mlist = [m for m in MONTHS if prev_month(cur_m, 11) <= m <= cur_m]
+    else:
+        mlist = [cur_m]
+    return df[ym.isin(mlist)], mlist
+
+
+def _main_attr(d, keys, col):
+    t = (d.groupby(keys + [col], dropna=False).TOTAL_VOLUME.sum().reset_index()
+         .sort_values("TOTAL_VOLUME", ascending=False).drop_duplicates(keys))
+    return t[keys + [col]]
 
 
 def profit_table(d, keys):
-    """Per-entity volume and NET MDR REVENUE = Σ(MDR × volume) − Σ(interchange rate × volume)
-    = gross MDR revenue net of interchange. Margin (bps) = net MDR revenue ÷ volume × 10,000
-    (= volume-weighted MDR − interchange spread). Actuals – not run-rated."""
+    """Per entity: volume, gross MDR revenue Σ(MDR×vol), interchange Σ(IC×vol), net MDR revenue, margin bps,
+    weighted MDR / IC, ticket, main industry / MCC. Actuals (not run-rated)."""
     keys = keys if isinstance(keys, list) else [keys]
     g = d.groupby(keys, dropna=False).agg(
         VOLUME=("TOTAL_VOLUME", "sum"), TXN_COUNT=("TOTAL_COUNT", "sum"),
         MDR_REV=("MDR_X_VOL", "sum"), IC_COST=("IC_X_VOL", "sum"),
         MONTHS=("YEAR_MONTH", "nunique")).reset_index()
     g = g[g.VOLUME > 0].copy()
+    if g.empty:
+        return g
     g["NET_REV"] = g.MDR_REV - g.IC_COST
     g["WTD_MDR"] = g.MDR_REV / g.VOLUME
     g["WTD_IC"] = g.IC_COST / g.VOLUME
     g["MARGIN_BPS"] = g.NET_REV / g.VOLUME * 1e4
     g["TICKET"] = g.VOLUME / g.TXN_COUNT.where(g.TXN_COUNT > 0)
-    g["NET_REV_PER_TXN"] = g.NET_REV / g.TXN_COUNT.where(g.TXN_COUNT > 0)
     g["NAME"] = g[keys].astype(str).agg(" › ".join, axis=1)
+    if "INDUSTRY" not in keys:
+        g = g.merge(_main_attr(d, keys, "INDUSTRY"), on=keys, how="left")
+    if "MCC" not in keys:
+        g = g.merge(_main_attr(d, keys, "MCC"), on=keys, how="left")
     return g
 
 
@@ -321,21 +321,35 @@ def assign_quadrants(g, pareto_pct, hurdle_bps):
     g = g.sort_values("VOLUME", ascending=False).copy()
     share = g.VOLUME / g.VOLUME.sum()
     g["VOL_SHARE"] = share
-    g["HIGH_VOL"] = (share.cumsum() - share) < pareto_pct / 100      # merchants making up the top X% of volume
+    g["HIGH_VOL"] = (share.cumsum() - share) < pareto_pct / 100
     vol_cut = g.loc[g.HIGH_VOL, "VOLUME"].min() if g.HIGH_VOL.any() else g.VOLUME.max()
     prof = g.MARGIN_BPS >= hurdle_bps
-    quads = list(QUAD_COLORS)
-    g["QUADRANT"] = np.select([g.HIGH_VOL & prof, g.HIGH_VOL & ~prof, ~g.HIGH_VOL & prof],
-                              quads[:3], default=quads[3])
+    q = list(QUAD_COLORS)
+    g["QUADRANT"] = np.select([g.HIGH_VOL & prof, g.HIGH_VOL & ~prof, ~g.HIGH_VOL & prof], q[:3], default=q[3])
     return g, vol_cut
 
 
-def need_card():
-    return True
+def seg_level_picker(prefix, allow_all=False):
+    cA, cB = st.columns([1.5, 2])
+    opts = (["All"] if allow_all else []) + ["Direct Merchant", "Payment Facilitator"]
+    seg = cA.radio("Segment", opts, horizontal=True, key=f"{prefix}_seg")
+    lv = {"Merchant / PF": ["PF_DM_NAME"]}
+    if seg == "Payment Facilitator":
+        lv.update({"MID": ["PF_DM_NAME", MID_COL], "Sub-merchant": ["PF_DM_NAME", SUB_COL]})
+    lvl = cB.radio("Level", list(lv), horizontal=True, key=f"{prefix}_lvl_{seg}")
+    d = dper if seg == "All" else dper[dper.PF_DM_TAG == seg]
+    return seg, lv[lvl], d
+
+
+def money_table(t, fmt, height=None):
+    kw = dict(width="stretch", hide_index=True)
+    if height:
+        kw["height"] = height
+    st.dataframe(t.style.format(fmt, na_rep="-"), **kw)
 
 
 # ================================================================ SIDEBAR
-st.sidebar.title("Profitability Map")
+st.sidebar.title("Profitability")
 if MAIN_APP_URL:
     st.sidebar.markdown(f"[← Back to main dashboard]({MAIN_APP_URL})")
 upload = st.sidebar.file_uploader("Upload Card MIS CSV (optional)", type=["csv", "xlsx"], key="up_card")
@@ -366,213 +380,323 @@ if card_raw is None:
     st.error("The selected file is not a Card MIS file.")
     st.stop()
 
-
-def data_max_tran_date(d, ym):
-    if DATE_COL not in d.columns:
-        return None, f"the loaded card file has no {DATE_COL} column"
-    s_all = d.loc[d["YEAR_MONTH"] == ym, DATE_COL]
-    s = s_all.dropna()
-    if s.empty:
-        return None, f"{DATE_COL} is blank / unreadable for {ym} ({len(s_all):,} rows)"
-    p = pd.Period(ym, "M")
-    s_in = s[(s >= p.start_time) & (s <= p.end_time)]
-    if s_in.empty:
-        return None, f"{DATE_COL} values for {ym} fall outside that month (e.g. {s.max():%Y-%m-%d})"
-    return s_in.max().date(), None
-
-
-LATEST_M = card_raw["YEAR_MONTH"].max()
-lp_ = pd.Period(LATEST_M, "M")
-dim_ = calendar.monthrange(lp_.year, lp_.month)[1]
+MONTHS = sorted(card_raw["YEAR_MONTH"].dropna().unique())
+LATEST_M = MONTHS[-1]
+_lp = pd.Period(LATEST_M, "M")
+DIM_LATEST = calendar.monthrange(_lp.year, _lp.month)[1]
 auto_dt, _why = data_max_tran_date(card_raw, LATEST_M)
-card_asof = auto_dt or date(lp_.year, lp_.month, dim_)
+card_asof = auto_dt or date(_lp.year, _lp.month, DIM_LATEST)
+PARTIAL = card_asof.day < DIM_LATEST
 st.sidebar.caption(f"Latest month {LATEST_M}: data as of **{card_asof:%b %d, %Y}**"
                    + ("" if auto_dt else f" (no {DATE_COL} – assumed full month)"))
-months = sorted(card_raw["YEAR_MONTH"].dropna().unique())
-cur_m = st.sidebar.selectbox("Reporting month", months, index=len(months) - 1, key="cur_m")
+cur_m = st.sidebar.selectbox("Reporting month", MONTHS, index=len(MONTHS) - 1, key="cur_m")
 include_credits = st.sidebar.checkbox("Net off credit (refund) transactions", value=True)
 df = card_raw if include_credits else card_raw[card_raw["TRXN_CODE"] == "Sale Transaction"]
-
-CUR_FACTOR = dim_ / card_asof.day if cur_m == LATEST_M else 1.0
 cp = pd.Period(cur_m, "M")
 CY, LY, END_MM = cp.year, cp.year - 1, cp.month
 ytd_lbl = f"Jan–{calendar.month_abbr[END_MM]}"
 
-st.title("Merchant Acquiring – Profitability Map")
-with st.container():
-    if need_card():
-        st.caption(
-            "Profitability basis = **net MDR revenue** = Σ(MDR × volume) − Σ(interchange rate × volume), i.e. gross "
-            "MDR revenue net of interchange. Other costs/income (txn, MID, license, processing fees) are **not** "
-            "included. **Margin (bps)** = net MDR revenue ÷ volume × 10,000 = weighted MDR − weighted interchange. "
-            "Actuals, not run-rated. Quadrants: **high volume** = merchants that together make up the top X% of the "
-            "segment's volume; **above hurdle** = margin ≥ hurdle.")
-        cA, cB, cC = st.columns([1.3, 1.3, 1.4])
-        per = cA.radio("Period", ["YTD", "MONTH"], horizontal=True, key="prof_per",
-                       format_func=lambda x: f"YTD {CY} ({ytd_lbl})" if x == "YTD"
-                       else f"{cur_m}{' (MTD)' if CUR_FACTOR != 1 else ''}")
-        pareto = cB.select_slider("High volume = top X% of segment volume", [50, 60, 70, 80, 90, 95],
-                                  value=80, key="prof_pareto")
-        hurdle = cC.number_input("Margin hurdle (bps of volume)", value=0.0, step=5.0, key="prof_hurdle",
-                                 help="0 = MDR at least covers interchange. Raise it to require a minimum spread, "
-                                      "e.g. to cover other per-volume costs.")
-        dper = ytd_slice(df, CY, END_MM) if per == "YTD" else df[df.YEAR_MONTH == cur_m]
-        per_lbl = f"YTD {CY}" if per == "YTD" else cur_m
+PER = st.sidebar.radio("Period", ["YTD", "L12M", "MONTH"], key="per",
+                       format_func={"YTD": f"YTD {CY} ({ytd_lbl})", "L12M": "Last 12 months",
+                                    "MONTH": f"{cur_m} only"}.get)
+dper, PER_MONTHS = period_rows(PER)
+PER_LBL = {"YTD": f"YTD {CY}", "L12M": f"L12M to {cur_m}", "MONTH": cur_m}[PER]
+M_EQ = months_eq(PER_MONTHS)
+ANN = 12 / M_EQ if M_EQ else float("nan")
+st.sidebar.caption(f"Period = {len(PER_MONTHS)} month(s) ≈ {M_EQ:.2f} full months → annualise ×{ANN:.2f}")
 
-        # ---- segment comparison
-        st.subheader(f"Direct Merchants vs Payment Facilitators – {per_lbl}")
-        rows = []
-        for s in ["Direct Merchant", "Payment Facilitator"]:
-            g = profit_table(dper[dper.PF_DM_TAG == s], "PF_DM_NAME")
-            if g.empty:
-                continue
-            g, _ = assign_quadrants(g, pareto, hurdle)
-            below = g.MARGIN_BPS < hurdle
-            rows.append({"Segment": s, "Merchants": len(g), "Volume": g.VOLUME.sum(),
-                         "Gross MDR revenue": g.MDR_REV.sum(), "Interchange": g.IC_COST.sum(),
-                         "Net MDR revenue": g.NET_REV.sum(),
-                         "Wtd MDR": g.MDR_REV.sum() / g.VOLUME.sum(), "Wtd IC": g.IC_COST.sum() / g.VOLUME.sum(),
-                         "Margin (bps)": g.NET_REV.sum() / g.VOLUME.sum() * 1e4,
-                         "# below hurdle": int(below.sum()),
-                         "Vol share below hurdle": g.loc[below, "VOLUME"].sum() / g.VOLUME.sum(),
-                         "Net MDR rev of below-hurdle": g.loc[below, "NET_REV"].sum()})
-        if rows:
-            comp = pd.DataFrame(rows)
-            st.dataframe(comp.style.format({"Volume": "{:,.0f}", "Gross MDR revenue": "{:,.0f}",
-                                            "Interchange": "{:,.0f}", "Net MDR revenue": "{:,.0f}",
-                                            "Wtd MDR": "{:.2%}", "Wtd IC": "{:.2%}", "Margin (bps)": "{:+.1f}",
-                                            "Vol share below hurdle": "{:.1%}",
-                                            "Net MDR rev of below-hurdle": "{:,.0f}"}, na_rep="-"),
-                         width="stretch", hide_index=True)
+SECTIONS = ["① Profitability Map", "② Repricing Simulator", "③ Minimum MDR Floor"]
+st.title("Merchant Acquiring – Profitability")
+SEC = st.radio("Section", SECTIONS, horizontal=True, key="sec", label_visibility="collapsed")
+st.caption(f"Basis: **net MDR revenue = Σ(MDR × volume) − Σ(interchange rate × volume)** · {PER_LBL} · "
+           "actual volumes (not run-rated); annualised figures scale by 12 ÷ months in period. "
+           "Other costs (txn, MID, processing, license fees) are not included.")
 
-        # ---- one segment
-        st.divider()
-        cA, cB = st.columns([1.3, 2])
-        seg_p = cA.radio("Segment", ["Direct Merchant", "Payment Facilitator"], horizontal=True, key="prof_seg")
-        lvl_map = {"PF_DM_NAME": ["PF_DM_NAME"]}
-        if seg_p == "Payment Facilitator":
-            lvl_map.update({MID_COL: ["PF_DM_NAME", MID_COL], SUB_COL: ["PF_DM_NAME", SUB_COL]})
-        lvl = cB.radio("Level", list(lvl_map), horizontal=True, key=f"prof_lvl_{seg_p}",
-                       format_func={"PF_DM_NAME": "Merchant / PF", MID_COL: "MID", SUB_COL: "Sub-merchant"}.get)
-        g = profit_table(dper[dper.PF_DM_TAG == seg_p], lvl_map[lvl])
+# ================================================================ ① PROFITABILITY MAP
+if SEC == SECTIONS[0]:
+    cA, cB = st.columns(2)
+    pareto = cA.select_slider("High volume = top X% of segment volume", [50, 60, 70, 80, 90, 95], value=80,
+                              key="prof_pareto")
+    hurdle = cB.number_input("Margin hurdle (bps of volume)", value=0.0, step=5.0, key="prof_hurdle")
+
+    rows = []
+    for s in ["Direct Merchant", "Payment Facilitator"]:
+        g = profit_table(dper[dper.PF_DM_TAG == s], "PF_DM_NAME")
         if g.empty:
-            st.info("No volume for this segment / period.")
+            continue
+        below = g.MARGIN_BPS < hurdle
+        rows.append({"Segment": s, "Merchants": len(g), "Volume": g.VOLUME.sum(), "Gross MDR revenue": g.MDR_REV.sum(),
+                     "Interchange": g.IC_COST.sum(), "Net MDR revenue": g.NET_REV.sum(),
+                     "Wtd MDR": g.MDR_REV.sum() / g.VOLUME.sum(), "Wtd IC": g.IC_COST.sum() / g.VOLUME.sum(),
+                     "Margin (bps)": g.NET_REV.sum() / g.VOLUME.sum() * 1e4, "# below hurdle": int(below.sum()),
+                     "Vol share below hurdle": g.loc[below, "VOLUME"].sum() / g.VOLUME.sum()})
+    if rows:
+        st.subheader(f"Direct Merchants vs Payment Facilitators – {PER_LBL}")
+        money_table(pd.DataFrame(rows), {"Volume": "{:,.0f}", "Gross MDR revenue": "{:,.0f}", "Interchange": "{:,.0f}",
+                                         "Net MDR revenue": "{:,.0f}", "Wtd MDR": "{:.2%}", "Wtd IC": "{:.2%}",
+                                         "Margin (bps)": "{:+.1f}", "Vol share below hurdle": "{:.1%}"})
+    st.divider()
+    seg_p, keys, dseg = seg_level_picker("map")
+    g = profit_table(dseg, keys)
+    if g.empty:
+        st.info("No volume for this segment / period.")
+    else:
+        g, vol_cut = assign_quadrants(g, pareto, hurdle)
+        tot_v, tot_r = g.VOLUME.sum(), g.NET_REV.sum()
+        below = g.MARGIN_BPS < hurdle
+        c = st.columns(4)
+        c[0].metric(f"Volume ({PER_LBL})", fmt_php(tot_v))
+        c[1].metric("Net MDR revenue", fmt_php(tot_r), f"{tot_r / tot_v * 1e4:+.1f} bps of volume", delta_color="off")
+        c[2].metric(f"Below hurdle ({hurdle:+.0f} bps)", f"{int(below.sum()):,} of {len(g):,}",
+                    f"{g.loc[below, 'VOLUME'].sum() / tot_v:.1%} of volume", delta_color="off")
+        c[3].metric("Net MDR rev from below-hurdle", fmt_php(g.loc[below, "NET_REV"].sum()), delta_color="off")
+        lo, hi = np.nanpercentile(g.MARGIN_BPS, [2, 98])
+        lo, hi = min(lo, hurdle - 10), max(hi, hurdle + 10)
+        pad = (hi - lo) * 0.08
+        g["Y"] = g.MARGIN_BPS.clip(lo - pad, hi + pad)
+        g["Shown"] = np.where(g.MARGIN_BPS.between(lo - pad, hi + pad), "in range", "clipped (outlier)")
+        g["SIZE"] = g.NET_REV.abs()
+        fig = px.scatter(g, x="VOLUME", y="Y", color="QUADRANT", size="SIZE", size_max=40, log_x=True,
+                         symbol="Shown", symbol_map={"in range": "circle", "clipped (outlier)": "triangle-up"},
+                         color_discrete_map=QUAD_COLORS, category_orders={"QUADRANT": list(QUAD_COLORS)},
+                         hover_name="NAME",
+                         hover_data={"VOLUME": ":,.0f", "NET_REV": ":,.0f", "MARGIN_BPS": ":+.1f", "WTD_MDR": ":.2%",
+                                     "WTD_IC": ":.2%", "Y": False, "SIZE": False, "Shown": False, "QUADRANT": False},
+                         labels={"VOLUME": f"Volume ({PER_LBL}, log)", "Y": "Net MDR margin (bps)"},
+                         title=f"Profitability map – {seg_p} · bubble = |net MDR revenue|")
+        fig.add_hline(y=hurdle, line_dash="dash", line_color="grey", annotation_text=f"hurdle {hurdle:+.0f} bps")
+        fig.add_vline(x=vol_cut, line_dash="dash", line_color="grey",
+                      annotation_text=f"high-volume cut-off {fmt_php(vol_cut)}")
+        st.plotly_chart(fig.update_layout(height=600, legend_title_text=""), width="stretch")
+        qs = (g.groupby("QUADRANT").agg(Entities=("NAME", "count"), Volume=("VOLUME", "sum"), Net=("NET_REV", "sum"))
+              .reindex(list(QUAD_COLORS)).fillna(0).reset_index())
+        qs["Vol share"] = qs.Volume / tot_v
+        qs["Margin (bps)"] = qs.Net / qs.Volume.where(qs.Volume > 0) * 1e4
+        money_table(qs.rename(columns={"QUADRANT": "Quadrant", "Net": "Net MDR revenue"}),
+                    {"Entities": "{:,.0f}", "Volume": "{:,.0f}", "Net MDR revenue": "{:,.0f}", "Vol share": "{:.1%}",
+                     "Margin (bps)": "{:+.1f}"})
+        tbl = g.sort_values("MARGIN_BPS")[["NAME", "QUADRANT", "INDUSTRY", "VOLUME", "TICKET", "WTD_MDR", "WTD_IC",
+                                           "MARGIN_BPS", "NET_REV"]]
+        tbl.columns = ["Name", "Quadrant", "Main industry", "Volume", "Avg ticket", "Wtd MDR", "Wtd IC",
+                       "Margin (bps)", "Net MDR revenue"]
+        money_table(tbl, {"Volume": "{:,.0f}", "Avg ticket": "{:,.0f}", "Wtd MDR": "{:.2%}", "Wtd IC": "{:.2%}",
+                          "Margin (bps)": "{:+.1f}", "Net MDR revenue": "{:,.0f}"}, height=380)
+
+# ================================================================ ② REPRICING SIMULATOR
+if SEC == SECTIONS[1]:
+    st.caption("Pick who to reprice and how, then set the share of volume you expect to lose from merchants whose "
+               "MDR goes **up**. New net MDR revenue = (new MDR − current weighted interchange) × retained volume. "
+               "Interchange rates are assumed unchanged.")
+    seg_s, keys, dseg = seg_level_picker("sim", allow_all=True)
+    g = profit_table(dseg, keys)
+    if g.empty:
+        st.info("No volume for this segment / period.")
+        st.stop()
+    g, _ = assign_quadrants(g, 80, 0.0)
+
+    st.markdown("##### 1 · Who to reprice")
+    cA, cB = st.columns([1.2, 2.8])
+    mode = cA.radio("Select by", ["Margin below threshold", "Industry", "Quadrant", "Specific names",
+                                  "Everyone in segment"], key="sim_mode")
+    if mode == "Margin below threshold":
+        thr = cB.number_input("Reprice entities with net MDR margin below (bps)", value=0.0, step=5.0, key="sim_thr")
+        sel = g.MARGIN_BPS < thr
+    elif mode == "Industry":
+        inds = cB.multiselect("Industries", sorted(g.INDUSTRY.dropna().unique()), key="sim_ind")
+        sel = g.INDUSTRY.isin(inds)
+    elif mode == "Quadrant":
+        qd = cB.multiselect("Quadrants (80% volume cut-off, 0 bps hurdle)", list(QUAD_COLORS),
+                            default=[list(QUAD_COLORS)[1]], key="sim_quad")
+        sel = g.QUADRANT.isin(qd)
+    elif mode == "Specific names":
+        names = cB.multiselect("Entities", g.sort_values("VOLUME", ascending=False).NAME.tolist(), key="sim_names")
+        sel = g.NAME.isin(names)
+    else:
+        sel = pd.Series(True, index=g.index)
+    min_vol = cB.number_input("…and with period volume of at least (₱)", value=0.0, step=100000.0, key="sim_minvol")
+    sel &= g.VOLUME >= min_vol
+
+    st.markdown("##### 2 · Pricing action")
+    cA, cB, cC = st.columns([1.6, 1.2, 1.2])
+    action = cA.radio("Action", ["Add bps to current MDR", "Set MDR to a fixed rate",
+                                 "Raise to floor (interchange + spread)"], key="sim_act")
+    if action == "Add bps to current MDR":
+        x = cB.number_input("Increase (bps)", value=10.0, step=5.0, key="sim_add")
+        new = g.WTD_MDR + x / 1e4
+    elif action == "Set MDR to a fixed rate":
+        x = cB.number_input("New MDR (%)", value=2.00, step=0.05, format="%.2f", key="sim_set")
+        new = pd.Series(x / 100, index=g.index)
+    else:
+        x = cB.number_input("Minimum spread over interchange (bps)", value=30.0, step=5.0, key="sim_spread")
+        new = np.maximum(g.WTD_MDR, g.WTD_IC + x / 1e4)
+    attr = cC.slider("Volume lost from merchants whose MDR rises (%)", 0, 60, 10, key="sim_attr") / 100
+
+    g["NEW_MDR"] = np.where(sel, new, g.WTD_MDR)
+    g["CHANGED"] = sel & (g.NEW_MDR.round(8) != g.WTD_MDR.round(8))
+    g["UP"] = g.NEW_MDR > g.WTD_MDR + 1e-10
+    g["NEW_VOL"] = np.where(g.UP, g.VOLUME * (1 - attr), g.VOLUME)
+    g["NEW_REV"] = (g.NEW_MDR - g.WTD_IC) * g.NEW_VOL
+    g["DELTA"] = g.NEW_REV - g.NET_REV
+
+    ch = g[g.CHANGED]
+    cur_tot, new_tot = g.NET_REV.sum(), g.NEW_REV.sum()
+    st.markdown("##### 3 · Result")
+    if ch.empty:
+        st.info("No entities are repriced with these settings.")
+    else:
+        full = ((ch.NEW_MDR - ch.WTD_IC) * ch.VOLUME).sum()
+        cur_ch = ch.NET_REV.sum()
+        if full <= 0:
+            be_txt = "n/a – new prices still below interchange"
+        elif cur_ch <= 0:
+            be_txt = "any – repriced group earns ≤ 0 today"
         else:
-            g, vol_cut = assign_quadrants(g, pareto, hurdle)
-            tot_v, tot_rev = g.VOLUME.sum(), g.NET_REV.sum()
-            below = g.MARGIN_BPS < hurdle
-            c = st.columns(5)
-            c[0].metric(f"Volume ({per_lbl})", fmt_php(tot_v))
-            c[1].metric("Gross MDR revenue", fmt_php(g.MDR_REV.sum()), f"less interchange {fmt_php(g.IC_COST.sum())}",
-                        delta_color="off")
-            c[2].metric("Net MDR revenue", fmt_php(tot_rev), f"{tot_rev / tot_v * 1e4:+.1f} bps of volume",
-                        delta_color="off")
-            c[3].metric(f"Below hurdle ({hurdle:+.0f} bps)", f"{int(below.sum()):,} of {len(g):,}",
-                        f"{g.loc[below, 'VOLUME'].sum() / tot_v:.1%} of volume", delta_color="off")
-            c[4].metric("Net MDR rev from below-hurdle", fmt_php(g.loc[below, "NET_REV"].sum()),
-                        f"vs {fmt_php(g.loc[~below, 'NET_REV'].sum())} from the rest", delta_color="off")
+            be_txt = f"{max(0.0, 1 - cur_ch / full):.1%}"
+        c = st.columns(5)
+        c[0].metric("Entities repriced", f"{len(ch):,} of {len(g):,}",
+                    f"{ch.VOLUME.sum() / g.VOLUME.sum():.1%} of volume", delta_color="off")
+        c[1].metric(f"Net MDR revenue – current ({PER_LBL})", fmt_php(cur_tot),
+                    f"{cur_tot / g.VOLUME.sum() * 1e4:+.1f} bps", delta_color="off")
+        c[2].metric("Net MDR revenue – simulated", fmt_php(new_tot),
+                    f"{fmt_php(new_tot - cur_tot)} ({(new_tot - cur_tot) / abs(cur_tot):+.1%})" if cur_tot else None)
+        c[3].metric("Annualised uplift", fmt_php((new_tot - cur_tot) * ANN), f"×{ANN:.2f} of period", delta_color="off")
+        c[4].metric("Break-even volume loss", be_txt, "above this, repricing loses money", delta_color="off")
 
-            qs = (g.groupby("QUADRANT").agg(Entities=("NAME", "count"), Volume=("VOLUME", "sum"),
-                                            Net_rev=("NET_REV", "sum")).reindex(list(QUAD_COLORS)).fillna(0)
-                  .reset_index())
-            qs["Vol share"] = qs.Volume / tot_v
-            qs["Rev share"] = qs.Net_rev / tot_rev if tot_rev else float("nan")
-            qs["Margin (bps)"] = qs.Net_rev / qs.Volume.where(qs.Volume > 0) * 1e4
-            st.dataframe(qs.rename(columns={"QUADRANT": "Quadrant", "Net_rev": "Net MDR revenue"})
-                         .style.format({"Entities": "{:,.0f}", "Volume": "{:,.0f}", "Net MDR revenue": "{:,.0f}",
-                                        "Vol share": "{:.1%}", "Rev share": "{:.1%}", "Margin (bps)": "{:+.1f}"},
-                                       na_rep="-"), width="stretch", hide_index=True)
+        # sensitivity
+        xs = np.linspace(0, 0.6, 61)
+        base_unch = g.loc[~g.UP, "NEW_REV"].sum()
+        up = g[g.UP]
+        ys = [base_unch + ((up.NEW_MDR - up.WTD_IC) * up.VOLUME * (1 - a)).sum() for a in xs]
+        sens = pd.DataFrame({"Volume lost": xs, "Simulated net MDR revenue": ys})
+        f1 = px.line(sens, x="Volume lost", y="Simulated net MDR revenue",
+                     title="Sensitivity – simulated net MDR revenue vs volume lost from repriced merchants")
+        f1.add_hline(y=cur_tot, line_dash="dash", line_color="grey", annotation_text="current")
+        f1.add_vline(x=attr, line_dash="dot", line_color=RR_COLOR, annotation_text="assumed")
+        f1.update_xaxes(tickformat=".0%")
+        c1, c2 = st.columns(2)
+        c1.plotly_chart(f1.update_layout(height=430), width="stretch")
+        top = ch.reindex(ch.DELTA.abs().sort_values(ascending=False).index).head(15).sort_values("DELTA")
+        c2.plotly_chart(px.bar(top, x="DELTA", y="NAME", orientation="h", title="Largest revenue changes (₱, period)",
+                               color=(top.DELTA >= 0).map({True: "Gain", False: "Loss"}),
+                               color_discrete_map={"Gain": "#2E8B57", "Loss": "#C0392B"},
+                               hover_data={"WTD_MDR": ":.2%", "NEW_MDR": ":.2%", "WTD_IC": ":.2%"})
+                        .update_layout(height=430, showlegend=False).update_yaxes(type="category", title=None),
+                        width="stretch")
+        tbl = ch.sort_values("DELTA", ascending=False)[
+            ["NAME", "INDUSTRY", "VOLUME", "NEW_VOL", "WTD_IC", "WTD_MDR", "NEW_MDR", "MARGIN_BPS", "NET_REV",
+             "NEW_REV", "DELTA"]].copy()
+        tbl.insert(8, "NEW_BPS", (tbl.NEW_MDR - tbl.WTD_IC) * 1e4)
+        tbl["ANN_DELTA"] = tbl.DELTA * ANN
+        tbl.columns = ["Name", "Main industry", "Volume", "Retained volume", "Wtd IC", "Current MDR", "New MDR",
+                       "Current margin (bps)", "New margin (bps)", "Current net MDR rev", "New net MDR rev",
+                       "Δ (period)", "Δ (annualised)"]
+        money_table(tbl, {"Volume": "{:,.0f}", "Retained volume": "{:,.0f}", "Wtd IC": "{:.2%}", "Current MDR": "{:.2%}",
+                          "New MDR": "{:.2%}", "Current margin (bps)": "{:+.1f}", "New margin (bps)": "{:+.1f}",
+                          "Current net MDR rev": "{:,.0f}", "New net MDR rev": "{:,.0f}", "Δ (period)": "{:+,.0f}",
+                          "Δ (annualised)": "{:+,.0f}"}, height=400)
+        st.download_button("Download repricing scenario (CSV)", tbl.to_csv(index=False).encode(),
+                           file_name=f"repricing_{PER_LBL.replace(' ', '_')}.csv", key="sim_dl")
+        st.caption("Break-even volume loss = 1 − current net MDR revenue ÷ net MDR revenue at the new price with full "
+                   "volume (for the repriced group). Merchants whose MDR goes down (fixed-rate action) keep their "
+                   "volume in this model.")
 
-            # ---- map: volume (log) vs margin bps
-            lo, hi = np.nanpercentile(g.MARGIN_BPS, [2, 98])
-            lo, hi = min(lo, hurdle - 10), max(hi, hurdle + 10)
-            pad = (hi - lo) * 0.08
-            g["Y"] = g.MARGIN_BPS.clip(lo - pad, hi + pad)
-            g["Shown"] = np.where(g.MARGIN_BPS.between(lo - pad, hi + pad), "in range", "clipped (outlier)")
-            g["SIZE"] = g.NET_REV.abs()
-            hov = {"VOLUME": ":,.0f", "NET_REV": ":,.0f", "MARGIN_BPS": ":+.1f", "WTD_MDR": ":.2%", "WTD_IC": ":.2%",
-                   "TICKET": ":,.0f", "Y": False, "SIZE": False, "Shown": False, "QUADRANT": False}
-            lbl = {"VOLUME": f"Volume ({per_lbl}, log scale)", "Y": "Net MDR margin (bps)",
-                   "NET_REV": "Net MDR revenue", "MARGIN_BPS": "Margin bps", "WTD_MDR": "Wtd MDR",
-                   "WTD_IC": "Wtd IC", "TICKET": "Avg ticket"}
-            fig = px.scatter(g, x="VOLUME", y="Y", color="QUADRANT", size="SIZE", size_max=40, log_x=True,
-                             symbol="Shown", symbol_map={"in range": "circle", "clipped (outlier)": "triangle-up"},
-                             color_discrete_map=QUAD_COLORS, category_orders={"QUADRANT": list(QUAD_COLORS)},
-                             hover_name="NAME", hover_data=hov, labels=lbl,
-                             title=f"Profitability map – {seg_p} ({per_lbl}) · bubble size = |net MDR revenue|")
-            fig.add_hline(y=hurdle, line_dash="dash", line_color="grey",
-                          annotation_text=f"hurdle {hurdle:+.0f} bps", annotation_position="top left")
-            fig.add_vline(x=vol_cut, line_dash="dash", line_color="grey",
-                          annotation_text=f"high-volume cut-off {fmt_php(vol_cut)}", annotation_position="top")
-            fig.update_layout(height=620, legend_title_text="")
-            st.plotly_chart(fig, width="stretch")
+# ================================================================ ③ MINIMUM MDR FLOOR
+if SEC == SECTIONS[2]:
+    st.caption("Floor MDR for each merchant = **its own weighted interchange + required spread + per-transaction "
+               "cost ÷ its average ticket**. Set the per-transaction cost to 0 to use the spread over interchange only.")
+    seg_f, keys, dseg = seg_level_picker("floor", allow_all=True)
+    cA, cB, cC = st.columns(3)
+    spread = cA.number_input("Required spread over interchange (bps)", value=30.0, step=5.0, key="fl_spread")
+    ptx = cB.number_input("Per-transaction cost to recover (₱, optional)", value=0.0, step=0.5, key="fl_ptx")
+    grp = cC.radio("Summarise floor by", ["INDUSTRY", "MCC", "TICKET_BAND"], horizontal=True, key="fl_grp",
+                   format_func={"INDUSTRY": "Industry", "MCC": "MCC", "TICKET_BAND": "Ticket size band"}.get)
+    g = profit_table(dseg, keys)
+    if g.empty:
+        st.info("No volume for this segment / period.")
+        st.stop()
+    g["FLOOR"] = g.WTD_IC + spread / 1e4 + (ptx / g.TICKET).fillna(0)
+    g["GAP_BPS"] = (g.WTD_MDR - g.FLOOR) * 1e4
+    g["BELOW"] = g.GAP_BPS < 0
+    g["UPLIFT"] = np.where(g.BELOW, (g.FLOOR - g.WTD_MDR) * g.VOLUME, 0.0)
+    bands = [0, 500, 2000, 10000, 50000, np.inf]
+    blabels = ["< ₱500", "₱500–2K", "₱2K–10K", "₱10K–50K", "≥ ₱50K"]
+    g["TICKET_BAND"] = pd.cut(g.TICKET, bands, labels=blabels, right=False).astype(str)
 
-            # ---- MDR vs interchange: distance above the diagonal = margin
-            c1, c2 = st.columns(2)
-            f2 = px.scatter(g, x="WTD_IC", y="WTD_MDR", color="QUADRANT", size="VOLUME", size_max=30,
-                            color_discrete_map=QUAD_COLORS, hover_name="NAME",
-                            hover_data={"WTD_IC": ":.2%", "WTD_MDR": ":.2%", "MARGIN_BPS": ":+.1f",
-                                        "VOLUME": ":,.0f", "QUADRANT": False},
-                            labels={"WTD_IC": "Weighted interchange", "WTD_MDR": "Weighted MDR",
-                                    "MARGIN_BPS": "Margin bps"},
-                            title="MDR vs interchange – dotted line = MDR equals interchange "
-                                  "(below it = selling under cost); dashed = MDR equals interchange + hurdle")
-            m = max(g.WTD_MDR.max(), g.WTD_IC.max()) * 1.05
-            f2.add_shape(type="line", x0=0, y0=0, x1=m, y1=m, line=dict(dash="dot", color="grey"))
-            if hurdle:
-                f2.add_shape(type="line", x0=0, y0=hurdle / 1e4, x1=m, y1=m + hurdle / 1e4,
-                             line=dict(dash="dash", color="grey"))
-            f2.update_xaxes(tickformat=".2%", range=[0, m]).update_yaxes(tickformat=".2%", range=[0, m])
-            c1.plotly_chart(f2.update_layout(height=480, showlegend=False), width="stretch")
-            movers = pd.concat([g.nsmallest(10, "NET_REV"), g.nlargest(10, "NET_REV")]).drop_duplicates("NAME") \
-                .sort_values("NET_REV")
-            c2.plotly_chart(px.bar(movers, x="NET_REV", y="NAME", orientation="h", color="QUADRANT",
-                                   color_discrete_map=QUAD_COLORS,
-                                   title="Top 10 / bottom 10 net MDR revenue contributors (₱)",
-                                   hover_data={"MARGIN_BPS": ":+.1f", "VOLUME": ":,.0f"},
-                                   labels={"NET_REV": "Net MDR revenue"})
-                            .update_layout(height=480, showlegend=False).update_yaxes(type="category", title=None),
-                            width="stretch")
+    below = g[g.BELOW]
+    c = st.columns(4)
+    c[0].metric("Entities below floor", f"{len(below):,} of {len(g):,}",
+                f"{below.VOLUME.sum() / g.VOLUME.sum():.1%} of volume", delta_color="off")
+    c[1].metric("Vol-weighted floor MDR", f"{(g.FLOOR * g.VOLUME).sum() / g.VOLUME.sum():.2%}",
+                f"current {g.MDR_REV.sum() / g.VOLUME.sum():.2%}", delta_color="off")
+    c[2].metric(f"Uplift if all raised to floor ({PER_LBL})", fmt_php(below.UPLIFT.sum()), "no volume loss",
+                delta_color="off")
+    c[3].metric("Annualised uplift", fmt_php(below.UPLIFT.sum() * ANN), f"×{ANN:.2f}", delta_color="off")
 
-            # ---- repricing view: revenue uplift if below-hurdle merchants were brought to the hurdle
-            if below.any():
-                gap = g.loc[below].assign(UPLIFT=lambda x: (hurdle - x.MARGIN_BPS) / 1e4 * x.VOLUME)
-                st.caption(f"Bringing the {int(below.sum())} below-hurdle entities up to a {hurdle:+.0f} bps margin "
-                           f"(same volume) would add **{fmt_php(gap.UPLIFT.sum())}** net MDR revenue for {per_lbl}.")
+    def _grp(t):
+        v = t.VOLUME.sum()
+        return pd.Series({
+            "Entities": len(t), "Volume": v, "Avg ticket": v / t.TXN_COUNT.sum() if t.TXN_COUNT.sum() else np.nan,
+            "Wtd IC": t.IC_COST.sum() / v, "Current wtd MDR": t.MDR_REV.sum() / v,
+            "Floor (vol-wtd)": (t.FLOOR * t.VOLUME).sum() / v,
+            "Floor (90th pct merchant)": np.nanpercentile(t.FLOOR, 90),
+            "Min current MDR": t.WTD_MDR.min(),
+            "# below floor": int(t.BELOW.sum()), "Vol below floor": t.loc[t.BELOW, "VOLUME"].sum() / v,
+            "Uplift to floor": t.UPLIFT.sum()})
 
-            tbl = g.sort_values("MARGIN_BPS")[["NAME", "QUADRANT", "VOLUME", "VOL_SHARE", "TXN_COUNT", "TICKET",
-                                               "WTD_MDR", "WTD_IC", "MARGIN_BPS", "MDR_REV", "IC_COST", "NET_REV",
-                                               "NET_REV_PER_TXN", "MONTHS"]]
-            tbl.columns = ["Name", "Quadrant", "Volume", "Vol share", "Txn", "Avg ticket", "Wtd MDR", "Wtd IC",
-                           "Margin (bps)", "Gross MDR revenue", "Interchange", "Net MDR revenue",
-                           "Net MDR rev / txn", "Active months"]
-            st.dataframe(tbl.style.format({"Volume": "{:,.0f}", "Vol share": "{:.2%}", "Txn": "{:,.0f}",
-                                           "Avg ticket": "{:,.0f}", "Wtd MDR": "{:.2%}", "Wtd IC": "{:.2%}",
-                                           "Margin (bps)": "{:+.1f}", "Gross MDR revenue": "{:,.0f}",
-                                           "Interchange": "{:,.0f}", "Net MDR revenue": "{:,.0f}",
-                                           "Net MDR rev / txn": "{:,.2f}"}, na_rep="-"),
-                         width="stretch", hide_index=True, height=420)
-            st.download_button("Download profitability table (CSV)", tbl.to_csv(index=False).encode(),
-                               file_name=f"net_mdr_revenue_{seg_p.replace(' ', '_')}_{per_lbl}.csv", key="prof_dl")
+    gs = g.groupby(grp, dropna=False).apply(_grp, include_groups=False).reset_index()
+    if grp == "TICKET_BAND":
+        gs[grp] = pd.Categorical(gs[grp], [b for b in blabels if b in set(gs[grp])] +
+                                 [b for b in gs[grp] if b not in blabels], ordered=True)
+        gs = gs.sort_values(grp)
+    else:
+        gs = gs.sort_values("Volume", ascending=False)
+    gs["Headroom (bps)"] = (gs["Current wtd MDR"] - gs["Floor (vol-wtd)"]) * 1e4
+    gname = {"INDUSTRY": "Industry", "MCC": "MCC", "TICKET_BAND": "Ticket band"}[grp]
+    st.subheader(f"Suggested MDR floor by {gname.lower()} – {seg_f}, {PER_LBL}")
+    money_table(gs.rename(columns={grp: gname}),
+                {"Entities": "{:,.0f}", "Volume": "{:,.0f}", "Avg ticket": "{:,.0f}", "Wtd IC": "{:.2%}",
+                 "Current wtd MDR": "{:.2%}", "Floor (vol-wtd)": "{:.2%}", "Floor (90th pct merchant)": "{:.2%}",
+                 "Min current MDR": "{:.2%}", "Vol below floor": "{:.1%}", "Uplift to floor": "{:,.0f}",
+                 "Headroom (bps)": "{:+.1f}"}, height=360)
+    st.caption("**Floor (vol-wtd)** = typical floor for the group. **Floor (90th pct merchant)** = a conservative "
+               "single floor that covers 90% of merchants in the group (useful as a published minimum). "
+               "**Headroom** = current weighted MDR − vol-weighted floor.")
 
-            # ---- monthly trend for one entity
-            pick_n = st.selectbox("Monthly trend for", g.sort_values("VOLUME", ascending=False).NAME.tolist(),
-                                  key=f"prof_pick_{seg_p}_{lvl}")
-            keys = lvl_map[lvl]
-            sel_row = g[g.NAME == pick_n].iloc[0]
-            mask = np.logical_and.reduce([df[k].astype(str) == str(sel_row[k]) for k in keys])
-            dsel = df[(df.PF_DM_TAG == seg_p) & mask & (df.YEAR_MONTH <= cur_m)
-                      & (df.YEAR_MONTH >= prev_month(cur_m, 12))]
-            mt = profit_table(dsel, "YEAR_MONTH").sort_values("YEAR_MONTH")
-            c1, c2 = st.columns(2)
-            c1.plotly_chart(px.bar(mt, x="YEAR_MONTH", y="NET_REV",
-                                   title=f"{pick_n} – monthly net MDR revenue (₱, actual)",
-                                   color=(mt.NET_REV >= 0).map({True: "Positive", False: "Negative"}),
-                                   color_discrete_map={"Positive": "#2E8B57", "Negative": "#C0392B"},
-                                   labels={"NET_REV": "Net MDR revenue"})
-                            .update_layout(showlegend=False).update_xaxes(type="category"), width="stretch")
-            c2.plotly_chart(rate_line(mt, "YEAR_MONTH", ["WTD_MDR", "WTD_IC"],
-                                      f"{pick_n} – weighted MDR vs interchange (gap = margin)"), width="stretch")
-            if cur_m == LATEST_M and CUR_FACTOR != 1:
-                st.caption(f"{cur_m} is month-to-date (as of {card_asof:%b %d}); net MDR revenue is MTD, "
-                           "margins are unaffected.")
+    top = gs.head(20) if grp != "TICKET_BAND" else gs
+    long = pd.concat([pd.DataFrame({gname: top[grp].astype(str), "Rate": top[c_], "Series": c_})
+                      for c_ in ["Wtd IC", "Floor (vol-wtd)", "Current wtd MDR"]])
+    c1, c2 = st.columns(2)
+    c1.plotly_chart(px.bar(long, x=gname, y="Rate", color="Series", barmode="group",
+                           color_discrete_map={"Wtd IC": "#A9B8C9", "Floor (vol-wtd)": RR_COLOR,
+                                               "Current wtd MDR": "#1F4E79"},
+                           title=f"Interchange vs floor vs current MDR by {gname.lower()}")
+                    .update_yaxes(tickformat=".2%").update_xaxes(type="category")
+                    .update_layout(height=460, legend_title_text=""), width="stretch")
+    gg = g[g.TICKET > 0].copy()
+    gg["Status"] = gg.BELOW.map({True: "Below floor", False: "At / above floor"})
+    gg["GAP_PLOT"] = gg.GAP_BPS.clip(*np.nanpercentile(gg.GAP_BPS, [2, 98]))
+    c2.plotly_chart(px.scatter(gg, x="TICKET", y="GAP_PLOT", color="Status", size="VOLUME", size_max=30, log_x=True,
+                               color_discrete_map={"Below floor": "#C0392B", "At / above floor": "#2E8B57"},
+                               hover_name="NAME", hover_data={"GAP_BPS": ":+.1f", "WTD_MDR": ":.2%", "FLOOR": ":.2%",
+                                                              "GAP_PLOT": False, "VOLUME": ":,.0f"},
+                               labels={"TICKET": "Average ticket (₱, log)", "GAP_PLOT": "Current MDR − floor (bps)"},
+                               title="Gap to floor by ticket size – small tickets need a higher floor "
+                                     "when per-txn cost > 0")
+                    .add_hline(y=0, line_dash="dash", line_color="grey")
+                    .update_layout(height=460, legend_title_text=""), width="stretch")
+
+    st.subheader("Entities priced below their floor")
+    bt = below.sort_values("UPLIFT", ascending=False)[["NAME", "INDUSTRY", "MCC", "VOLUME", "TICKET", "WTD_IC",
+                                                        "WTD_MDR", "FLOOR", "GAP_BPS", "UPLIFT"]].copy()
+    bt["ANN"] = bt.UPLIFT * ANN
+    bt.columns = ["Name", "Main industry", "Main MCC", "Volume", "Avg ticket", "Wtd IC", "Current MDR", "Floor MDR",
+                  "Gap (bps)", "Uplift to floor (period)", "Uplift (annualised)"]
+    money_table(bt, {"Volume": "{:,.0f}", "Avg ticket": "{:,.0f}", "Wtd IC": "{:.2%}", "Current MDR": "{:.2%}",
+                     "Floor MDR": "{:.2%}", "Gap (bps)": "{:+.1f}", "Uplift to floor (period)": "{:,.0f}",
+                     "Uplift (annualised)": "{:,.0f}"}, height=380)
+    cA, cB = st.columns(2)
+    cA.download_button("Download floor by group (CSV)", gs.to_csv(index=False).encode(),
+                       file_name=f"mdr_floor_by_{grp.lower()}.csv", key="fl_dl1")
+    cB.download_button("Download below-floor list (CSV)", bt.to_csv(index=False).encode(),
+                       file_name="below_floor_merchants.csv", key="fl_dl2")
+    st.caption("Uplift assumes no volume loss – use ② Repricing Simulator → 'Raise to floor' to test attrition.")
