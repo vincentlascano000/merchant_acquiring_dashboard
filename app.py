@@ -12,6 +12,7 @@ or uploaded in the sidebar (also auto-detected):
 
 Run-rate rule (per source): ONLY each source's latest month is run-rated (MTD x days / as-of day).
 Every prior month (incl. MoM / YoY / YTD LY bases) = actual, simple summation.
+Active merchant / sub-merchant = net volume > 0 in the period (counts are never run-rated).
 Resource use: only needed columns are read, rows are pre-aggregated, data is cached once (cache_resource),
 and only the selected section is rendered.
 """
@@ -661,10 +662,96 @@ def full_compare(d, by):
     return t
 
 
+# ================================================================ ACTIVE MERCHANT / SUB-MERCHANT COUNTS
+# "Active" = net volume > 0 in the period. Merchant = PF_DM_NAME (PF or direct merchant);
+# sub-merchant = PF_DM_NAME + MERCHANT_NAME_ORIG (for DMs this is the outlet / store name).
+COUNT_KEYS = {"Merchants / PFs": ["PF_DM_NAME"], "Sub-merchants": ["PF_DM_NAME", SUB_COL]}
+
+
+def active_set(d, keys, months):
+    """Set of key-tuples with net volume > 0 summed over `months`."""
+    s = d[d.YEAR_MONTH.isin(months)].groupby(keys, dropna=False).TOTAL_VOLUME.sum()
+    return set(s[s > 0].index)
+
+
+def count_metrics(d, keys):
+    """Active counts: current month, prev month, same month LY, YTD CY/LY + new / lost vs same month LY."""
+    ytd_cy = [m for m in months if m[:4] == str(CY) and int(m[5:7]) <= END_MM]
+    ytd_ly = [m for m in months if m[:4] == str(LY) and int(m[5:7]) <= END_MM]
+    s = {"CUR": active_set(d, keys, [cur_m]), "PM": active_set(d, keys, [mom_m]),
+         "LYM": active_set(d, keys, [yoy_m]), "YTD": active_set(d, keys, ytd_cy),
+         "YTDLY": active_set(d, keys, ytd_ly)}
+    n = {k: len(v) for k, v in s.items()}
+    n["NEW_YOY"] = len(s["CUR"] - s["LYM"])            # active now, not active same month LY
+    n["LOST_YOY"] = len(s["LYM"] - s["CUR"])           # active same month LY, not active now
+    n["NEW_YTD"] = len(s["YTD"] - s["YTDLY"])
+    n["LOST_YTD"] = len(s["YTDLY"] - s["YTD"])
+    n["HAS_LY"] = bool(ytd_ly)
+    return n
+
+
+def _dc(a, b):
+    if b == 0:
+        return "n/a"
+    return f"{a - b:+,} ({a / b - 1:+.1%})"
+
+
+def count_cards(d, title=None, which=("Merchants / PFs", "Sub-merchants")):
+    """Two rows of KPI cards (merchants, sub-merchants): month MoM/YoY, YTD YoY, new vs lost YoY."""
+    if title:
+        st.markdown(f"**{title}**")
+    for lbl in which:
+        n = count_metrics(d, COUNT_KEYS[lbl])
+        c = st.columns(4)
+        nm = "merchants / PFs" if lbl.startswith("Merchants") else "sub-merchants"
+        c[0].metric(f"Active {nm} – {cur_m}" + (" (MTD)" if CUR_FACTOR != 1 else ""),
+                    f"{n['CUR']:,}", f"{_dc(n['CUR'], n['PM'])} MoM | {_dc(n['CUR'], n['LYM'])} YoY")
+        c[1].metric(f"Active {nm} – YTD {CY}", f"{n['YTD']:,}",
+                    f"{_dc(n['YTD'], n['YTDLY'])} vs YTD {LY} ({n['YTDLY']:,})")
+        c[2].metric(f"New vs {yoy_m}", f"{n['NEW_YOY']:,}", f"lost {n['LOST_YOY']:,} · net {n['NEW_YOY'] - n['LOST_YOY']:+,}",
+                    delta_color="off")
+        c[3].metric(f"New YTD vs YTD {LY}", f"{n['NEW_YTD']:,}",
+                    f"lost {n['LOST_YTD']:,} · net {n['NEW_YTD'] - n['LOST_YTD']:+,}", delta_color="off")
+    if CUR_FACTOR != 1:
+        st.caption(f"{cur_m} is month-to-date (as of {card_asof:%b %d}) – merchants who haven't transacted yet this "
+                   "month aren't counted, so the month count can be understated vs full months. Counts are not run-rated.")
+
+
+def count_trend(d, keys, by=None):
+    """Monthly active counts (optionally split by `by`, e.g. PF_DM_TAG)."""
+    grp = ["YEAR_MONTH"] + ([by] if by else []) + keys
+    s = d[d.YEAR_MONTH <= cur_m].groupby(grp, dropna=False).TOTAL_VOLUME.sum().reset_index()
+    s = s[s.TOTAL_VOLUME > 0]
+    out = s.groupby(["YEAR_MONTH"] + ([by] if by else [])).size().reset_index(name="ACTIVE")
+    out["YEAR"] = out.YEAR_MONTH.str[:4]
+    out["MONTH"] = out.YEAR_MONTH.str[5:7].astype(int).map(lambda i: MON[i])
+    out["LABEL"] = out.YEAR_MONTH.where(~((out.YEAR_MONTH == LATEST_M) & (RR_FACTOR != 1)),
+                                        out.YEAR_MONTH + " (MTD)")
+    return out
+
+
+def count_table(d, by):
+    """Active merchant / sub-merchant counts per group (e.g. PF_DM_TAG or INDUSTRY): month, PM, LY, YTD, YTD LY."""
+    rows = []
+    for g, dg in d.groupby(by, dropna=False):
+        r = {by: g}
+        for lbl, keys in COUNT_KEYS.items():
+            n = count_metrics(dg, keys)
+            short = "Merch" if lbl.startswith("Merchants") else "Sub"
+            r.update({f"{short} {cur_m}": n["CUR"], f"{short} MoM": n["CUR"] - n["PM"],
+                      f"{short} YoY": n["CUR"] - n["LYM"], f"{short} YTD {CY}": n["YTD"],
+                      f"{short} YTD {LY}": n["YTDLY"],
+                      f"{short} YTD YoY %": safe_div(n["YTD"], n["YTDLY"]) - 1})
+        rows.append(r)
+    t = pd.DataFrame(rows)
+    fmt = {c: ("{:+.1%}" if c.endswith("%") else "{:+,.0f}" if c.endswith(("MoM", "YoY")) else "{:,.0f}")
+           for c in t.columns if c != by}
+    st.dataframe(t.style.format(fmt, na_rep="-"), width="stretch", hide_index=True)
+
+
 def yoy_treemap(d, root_label, title):
     """PF → MID → sub-merchant treemap. Size = YTD CY volume. Colour = YTD volume YoY computed AT EACH NODE
-    from summed volumes (Σ CY ÷ Σ LY − 1) – the same formula as the KPI cards – NOT plotly's default
-    volume-weighted average of the children's growth rates. Grey = new / LY base < MIN_LY_BASE (n.m.)."""
+    from summed volumes (Σ CY ÷ Σ LY − 1) – the same formula as the KPI cards. Grey = new / n.m."""
     lv0 = ytd_compare(d.assign(_ROOT=root_label), "_ROOT")
     lv1 = ytd_compare(d, MID_COL)
     lv2 = ytd_compare(d, [MID_COL, SUB_COL])
@@ -866,7 +953,29 @@ FULL_COLS = {
     "WEIGHTED_IC": f"{cur_m} Wtd IC", "WEIGHTED_IC_MoM_bps": "IC MoM (bps)",
     "INTERCHANGE_PHP": f"{cur_m} IC ₱{RR_TAG}",
     "N_MID": f"# MIDs ({cur_m})", "N_SUB": f"# Sub-merchants ({cur_m})",
+    "N_SUB_LY": f"# Sub-merchants ({yoy_m})", "N_SUB_YoY": "Sub-merchants YoY (Δ)",
+    "N_SUB_YTD": f"# Sub-merchants YTD {CY}", "N_SUB_YTDLY": f"# Sub-merchants YTD {LY}",
 }
+
+
+def add_sub_counts(t, d, by):
+    """Add active sub-merchant counts (same month LY, YTD CY / LY) per row of a full_compare table."""
+    by = by if isinstance(by, list) else [by]
+    keys = by + ([SUB_COL] if SUB_COL not in by else [])
+    ytd_cy = [m for m in months if m[:4] == str(CY) and int(m[5:7]) <= END_MM]
+    ytd_ly = [m for m in months if m[:4] == str(LY) and int(m[5:7]) <= END_MM]
+
+    def cnt(ms, name):
+        s = d[d.YEAR_MONTH.isin(ms)].groupby(keys, dropna=False).TOTAL_VOLUME.sum()
+        s = s[s > 0].reset_index()
+        return s.groupby(by).size().rename(name).reset_index()
+
+    for ms, name in [([cur_m], "N_SUB"), ([yoy_m], "N_SUB_LY"), (ytd_cy, "N_SUB_YTD"), (ytd_ly, "N_SUB_YTDLY")]:
+        t = t.drop(columns=[name], errors="ignore").merge(cnt(ms, name), on=by, how="left")
+    for c in ["N_SUB", "N_SUB_LY", "N_SUB_YTD", "N_SUB_YTDLY"]:
+        t[c] = t[c].fillna(0)
+    t["N_SUB_YoY"] = t.N_SUB - t.N_SUB_LY
+    return t
 
 
 def show_full(t, keys, extra=None, height=None):
@@ -881,6 +990,8 @@ def show_full(t, keys, extra=None, height=None):
             fmt[v] = "{:+.1f}"
         elif k.replace("YTD__", "") in RATE_KEYS:
             fmt[v] = "{:.2%}"
+        elif k == "N_SUB_YoY":
+            fmt[v] = "{:+,.0f}"
         else:
             fmt[v] = "{:,.0f}"
     for e in extra or []:
@@ -917,6 +1028,22 @@ def ytd_vs_ly_bar(t, key, title, top=15):
         height=max(380, 32 * len(t)), legend_title_text="")
 
 
+def count_trend_chart(d, title, by=None, cmap=None):
+    """Two charts: active merchants and active sub-merchants per month (latest month marked MTD)."""
+    c1, c2 = st.columns(2)
+    for col, (lbl, keys) in zip((c1, c2), COUNT_KEYS.items()):
+        t = count_trend(d, keys, by)
+        t = t[t.YEAR.isin(sorted(t.YEAR.unique())[-2:])]
+        fig = px.bar(t, x="LABEL", y="ACTIVE", color=by, barmode="group" if by else "relative",
+                     color_discrete_map=cmap or {}, title=f"{title} – active {'merchants / PFs' if lbl.startswith('Merchants') else 'sub-merchants'} per month",
+                     text="ACTIVE", labels={"ACTIVE": "Active", "LABEL": ""})
+        if not by:
+            fig.update_traces(marker_color=["#1F4E79" if "(MTD)" not in x else RR_COLOR for x in t.LABEL])
+        fig.update_traces(textposition="outside", texttemplate="%{text:,}")
+        col.plotly_chart(fig.update_xaxes(type="category").update_layout(legend_title_text="", height=380),
+                         width="stretch")
+
+
 # ================================================================ HEADER & SECTIONS
 st.title("Merchant Acquiring Dashboard")
 notes = []
@@ -928,7 +1055,6 @@ st.caption(f"Reporting month: **{cur_m}** · MoM vs **{mom_m}** · YoY vs **{yoy
            + " · ".join(notes) + " · all earlier months are actuals")
 st.caption(RR_LEGEND)
 
-# Only the selected section is computed and rendered (st.tabs would build every chart on every click).
 PAGES = ["1 · Total Acquiring (Card + QRPH)", "2 · Card YoY & YTD", "3 · PF vs DM Overview",
          "4 · Category Mix", "5 · Merchant Level", "6 · PF Level (MID → Sub-merchant)", "7 · QRPH"]
 PAGE = st.radio("Section", PAGES, horizontal=True, key="page", label_visibility="collapsed")
@@ -974,6 +1100,8 @@ if PAGE == PAGES[0]:
         is_rr = any_rr if n.startswith("Total") else (
             (cur_m == LATEST_M and RR_FACTOR != 1) if n.startswith("Card") else (cur_m == QR_LATEST and QR_RR != 1))
         series_kpis(r, n, rr=is_rr)
+    if HAS_CARD:
+        count_cards(df, "Card merchant base (QRPH file has no merchant detail)")
     st.subheader("Comparison table – current vs prev month vs LY, YTD, FY outlook")
     series_table(res)
     tot = add_period_cols(tot)
@@ -1023,6 +1151,9 @@ if PAGE == PAGES[1] and need_card():
                f"FY outlook = YTD ÷ {END_MM} × 12.")
     st.subheader(f"YTD {ytd_lbl}: {CY} vs {LY}")
     ytd_kpi_block(d4, "Total")
+    st.subheader(f"Active merchants & sub-merchants – {seg4}")
+    count_cards(d4)
+    count_trend_chart(d4, seg4)
     m_all = trend_actual(d4)
     m = year_filter(m_all, "yr_tab4")
     c1, c2 = st.columns(2)
@@ -1060,6 +1191,11 @@ if PAGE == PAGES[2] and need_card():
     for tag in seg.PF_DM_TAG.dropna():
         st.markdown(f"**{tag}**")
         kpi_row(seg[seg.PF_DM_TAG == tag].reset_index(drop=True))
+    st.subheader("Active merchants & sub-merchants by segment")
+    for tag in seg.PF_DM_TAG.dropna():
+        count_cards(df[df.PF_DM_TAG == tag], tag)
+    count_table(df, "PF_DM_TAG")
+    count_trend_chart(df, "PF vs DM", by="PF_DM_TAG", cmap=TAG_COLORS)
     tr = year_filter(trend_actual(df, "PF_DM_TAG"), "yr_tab1", default_last=2).sort_values("YEAR_MONTH")
     if not tr.empty:
         c1, c2 = st.columns(2)
@@ -1099,6 +1235,8 @@ if PAGE == PAGES[3] and need_card():
     st.plotly_chart(px.bar(cat.head(15), x="SHARE_CHG_PP", y="INDUSTRY", orientation="h",
                            title=f"Volume Share Change vs {mom_m} (pp)").update_yaxes(autorange="reversed"), width="stretch")
     show_table(cat.assign(**{"Vol Share": cat.VOL_SHARE}), ["INDUSTRY", "Vol Share"])
+    with st.expander(f"Active merchants & sub-merchants by category – {seg_pick}"):
+        count_table(d2, "INDUSTRY")
 
 # ================================================================ 5 – MERCHANT LEVEL
 if PAGE == PAGES[4] and need_card():
@@ -1164,6 +1302,8 @@ if PAGE == PAGES[4] and need_card():
     st.caption(f"YTD {ytd_lbl} {CY}{' (incl. run-rated ' + MON[END_MM] + ')' if CUR_FACTOR != 1 else ''} "
                f"vs YTD {ytd_lbl} {LY} actual · FY outlook = YTD ÷ {END_MM} × 12 vs FY {LY} actual")
     ytd_kpi_block(dd, label)
+    if sub_pick == "All":
+        count_cards(dd, f"Active sub-merchants / outlets under {pick}", which=("Sub-merchants",))
     trd_y = year_filter(trd_all, "yr_drill")
     c1, c2 = st.columns(2)
     c1.plotly_chart(line_rr(trd_y, "MONTH", "VOLUME", f"{label} – Monthly Volume by Year", color="YEAR",
@@ -1200,9 +1340,11 @@ if PAGE == PAGES[5] and need_card():
         st.caption(f"Hierarchy: **PF** (PF_DM_NAME) → **MID** (CARD_ACCEPTOR_ID) → **Sub-merchant** "
                    f"(MERCHANT_NAME_ORIG). YTD {ytd_lbl} {CY}{' incl. run-rated ' + MON[END_MM] if CUR_FACTOR != 1 else ''} "
                    f"vs {ytd_lbl} {LY} · month {cur_m}{RR_TAG} vs {mom_m} (MoM) and {yoy_m} (YoY). "
-                   f"YoY shown as '-' where the LY base is too small.")
+                   f"YoY shown as '-' where the LY base is too small. Active = net volume > 0.")
         st.subheader("All Payment Facilitators – YTD, YoY, MoM")
+        count_cards(dpf, "PF portfolio – active PFs & sub-merchants")
         allpf = full_compare(dpf, "PF_DM_NAME").sort_values("YTD__VOLUME", ascending=False)
+        allpf = add_sub_counts(allpf, dpf, "PF_DM_NAME")
         allpf["YTD Share"] = allpf.YTD__VOLUME / allpf.YTD__VOLUME.sum()
         show_full(allpf, "PF_DM_NAME", extra=["YTD Share"], height=380)
 
@@ -1212,17 +1354,18 @@ if PAGE == PAGES[5] and need_card():
         st.markdown(f"#### ① {pf} – YoY & YTD")
         ytd_kpi_block(dp, pf)
         cur_rows, pm_rows, ly_rows = dp[dp.YEAR_MONTH == cur_m], dp[dp.YEAR_MONTH == mom_m], dp[dp.YEAR_MONTH == yoy_m]
+        n_mid = cur_rows.loc[cur_rows.TOTAL_VOLUME > 0, MID_COL].nunique()
+        sm = count_metrics(dp, COUNT_KEYS["Sub-merchants"])
         c = st.columns(4)
-        n_mid, n_sub = cur_rows[MID_COL].nunique(), cur_rows[SUB_COL].nunique()
         c[0].metric(f"Active MIDs ({cur_m})", f"{n_mid:,}",
                     f"{n_mid - pm_rows[MID_COL].nunique():+,} MoM | {n_mid - ly_rows[MID_COL].nunique():+,} YoY")
-        c[1].metric(f"Active sub-merchants ({cur_m})", f"{n_sub:,}",
-                    f"{n_sub - pm_rows[SUB_COL].nunique():+,} MoM | {n_sub - ly_rows[SUB_COL].nunique():+,} YoY")
+        c[1].metric(f"Active sub-merchants ({cur_m})", f"{sm['CUR']:,}",
+                    f"{_dc(sm['CUR'], sm['PM'])} MoM | {_dc(sm['CUR'], sm['LYM'])} YoY")
+        c[2].metric(f"Active sub-merchants YTD {CY}", f"{sm['YTD']:,}",
+                    f"{_dc(sm['YTD'], sm['YTDLY'])} vs YTD {LY} ({sm['YTDLY']:,})")
         new_subs = set(cur_rows[SUB_COL]) - set(dp[dp.YEAR_MONTH < cur_m][SUB_COL])
-        c[2].metric(f"New sub-merchants in {cur_m}", f"{len(new_subs):,}", "first-ever transaction month",
-                    delta_color="off")
-        c[3].metric(f"Sub-merchants transacting YTD {CY}", f"{ytd_slice(dp, CY, END_MM)[SUB_COL].nunique():,}",
-                    f"LY YTD {ytd_slice(dp, LY, END_MM)[SUB_COL].nunique():,}", delta_color="off")
+        c[3].metric(f"New sub-merchants in {cur_m}", f"{len(new_subs):,}",
+                    f"new vs {yoy_m}: {sm['NEW_YOY']:,} · lost {sm['LOST_YOY']:,}", delta_color="off")
         tp_all = trend_actual(dp)
         tp = year_filter(tp_all, "yr_pf")
         c1, c2 = st.columns(2)
@@ -1239,6 +1382,7 @@ if PAGE == PAGES[5] and need_card():
 
         st.markdown(f"#### ③ MIDs under {pf}")
         mids = full_compare(dp, MID_COL).sort_values("YTD__VOLUME", ascending=False)
+        mids = add_sub_counts(mids, dp, MID_COL)
         mids["YTD Share of PF"] = mids.YTD__VOLUME / mids.YTD__VOLUME.sum()
         ind = (dp.groupby([MID_COL, "INDUSTRY"]).TOTAL_VOLUME.sum().reset_index()
                  .sort_values("TOTAL_VOLUME", ascending=False).drop_duplicates(MID_COL)
@@ -1265,7 +1409,7 @@ if PAGE == PAGES[5] and need_card():
                 return m
             r = mid_idx.loc[m]
             n = int(r["N_SUB"]) if pd.notna(r["N_SUB"]) else 0
-            return f"{m} · {r['Main industry']} · {n} subs"
+            return f"{m} · {r['Main industry']} · {n} active subs"
 
         mid_pick = cA.selectbox("MID", mid_opts, index=0, key="pf_mid_pick", format_func=_mid_lbl)
         rank_by = cB.radio("Rank sub-merchants by", ["YTD__VOLUME", "VOLUME"], horizontal=True, key="pf_rank",
