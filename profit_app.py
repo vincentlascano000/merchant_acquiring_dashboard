@@ -16,6 +16,8 @@ from datetime import date
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 from streamlit.delta_generator import DeltaGenerator as _DG
 
@@ -405,7 +407,8 @@ M_EQ = months_eq(PER_MONTHS)
 ANN = 12 / M_EQ if M_EQ else float("nan")
 st.sidebar.caption(f"Period = {len(PER_MONTHS)} month(s) ≈ {M_EQ:.2f} full months → annualise ×{ANN:.2f}")
 
-SECTIONS = ["① Profitability Map", "② Repricing Simulator", "③ Minimum MDR Floor"]
+SECTIONS = ["① Profitability Map", "② Repricing Simulator", "③ Minimum MDR Floor", "④ Revenue Waterfall",
+            "⑤ Margin Trend"]
 st.title("Merchant Acquiring – Profitability")
 SEC = st.radio("Section", SECTIONS, horizontal=True, key="sec", label_visibility="collapsed")
 st.caption(f"Basis: **net MDR revenue = Σ(MDR × volume) − Σ(interchange rate × volume)** · {PER_LBL} · "
@@ -450,24 +453,86 @@ if SEC == SECTIONS[0]:
         c[2].metric(f"Below hurdle ({hurdle:+.0f} bps)", f"{int(below.sum()):,} of {len(g):,}",
                     f"{g.loc[below, 'VOLUME'].sum() / tot_v:.1%} of volume", delta_color="off")
         c[3].metric("Net MDR rev from below-hurdle", fmt_php(g.loc[below, "NET_REV"].sum()), delta_color="off")
-        lo, hi = np.nanpercentile(g.MARGIN_BPS, [2, 98])
-        lo, hi = min(lo, hurdle - 10), max(hi, hurdle + 10)
-        pad = (hi - lo) * 0.08
-        g["Y"] = g.MARGIN_BPS.clip(lo - pad, hi + pad)
-        g["Shown"] = np.where(g.MARGIN_BPS.between(lo - pad, hi + pad), "in range", "clipped (outlier)")
-        g["SIZE"] = g.NET_REV.abs()
-        fig = px.scatter(g, x="VOLUME", y="Y", color="QUADRANT", size="SIZE", size_max=40, log_x=True,
-                         symbol="Shown", symbol_map={"in range": "circle", "clipped (outlier)": "triangle-up"},
-                         color_discrete_map=QUAD_COLORS, category_orders={"QUADRANT": list(QUAD_COLORS)},
-                         hover_name="NAME",
-                         hover_data={"VOLUME": ":,.0f", "NET_REV": ":,.0f", "MARGIN_BPS": ":+.1f", "WTD_MDR": ":.2%",
-                                     "WTD_IC": ":.2%", "Y": False, "SIZE": False, "Shown": False, "QUADRANT": False},
-                         labels={"VOLUME": f"Volume ({PER_LBL}, log)", "Y": "Net MDR margin (bps)"},
-                         title=f"Profitability map – {seg_p} · bubble = |net MDR revenue|")
-        fig.add_hline(y=hurdle, line_dash="dash", line_color="grey", annotation_text=f"hurdle {hurdle:+.0f} bps")
-        fig.add_vline(x=vol_cut, line_dash="dash", line_color="grey",
-                      annotation_text=f"high-volume cut-off {fmt_php(vol_cut)}")
-        st.plotly_chart(fig.update_layout(height=600, legend_title_text=""), width="stretch")
+        # ---------- chart display controls (bubble size + axis scaling) ----------
+        with st.expander("Chart display – bubble size & axis scaling", expanded=False):
+            d1, d2, d3, d4 = st.columns(4)
+            size_basis = d1.selectbox("Bubble size =", ["|Net MDR revenue|", "Volume", "Equal size"], key="map_sz_basis")
+            size_scale = d2.selectbox("Size scaling", ["Log (small merchants visible)", "Square root", "Linear"],
+                                      key="map_sz_scale",
+                                      help="Log compresses the gap between big and small merchants so small ones "
+                                           "stay visible. Linear is true-to-scale but hides small merchants.")
+            min_px, max_px = d3.slider("Bubble diameter (px, min–max)", 4, 90, (12, 60), key="map_sz_px")
+            label_n = d4.number_input("Label top N loss-makers", 0, 30, 10, step=1, key="map_lbl_n")
+            e1, e2, e3 = st.columns(3)
+            y_zoom = e1.selectbox("Y-axis zoom", ["Fit 2nd–98th pct", "Fit 5th–95th pct", "Fit 10th–90th pct",
+                                                 "Show everything"], key="map_yzoom",
+                                  help="Points outside the zoom are pinned to the edge as ▲ (true value in hover).")
+            x_log = e2.toggle("Log volume axis", value=True, key="map_xlog")
+            min_vol_show = e3.number_input("Hide entities with volume below (₱)", value=0.0, step=100000.0,
+                                           key="map_minvol", help="Chart only – tables and totals are unaffected.")
+
+        gp = g[g.VOLUME >= min_vol_show].copy()
+        if gp.empty:
+            st.info("No entities above the volume filter.")
+        else:
+            # Y-axis: percentile-based zoom, always keeps the hurdle line in view
+            pct = {"Fit 2nd–98th pct": (2, 98), "Fit 5th–95th pct": (5, 95),
+                   "Fit 10th–90th pct": (10, 90), "Show everything": (0, 100)}[y_zoom]
+            lo, hi = np.nanpercentile(gp.MARGIN_BPS, list(pct))
+            lo, hi = min(lo, hurdle - 10), max(hi, hurdle + 10)
+            pad = (hi - lo) * 0.08
+            gp["Y"] = gp.MARGIN_BPS.clip(lo - pad, hi + pad)
+            gp["Shown"] = np.where(gp.MARGIN_BPS.between(lo - pad, hi + pad), "in range", "clipped (outlier)")
+
+            # Bubble diameter in pixels: min_px for the smallest, max_px for the largest
+            raw = {"|Net MDR revenue|": gp.NET_REV.abs(), "Volume": gp.VOLUME,
+                   "Equal size": pd.Series(1.0, index=gp.index)}[size_basis].astype(float)
+            if size_basis != "Equal size":
+                raw = {"Log (small merchants visible)": np.log10(raw.clip(lower=0) + 1),
+                       "Square root": np.sqrt(raw.clip(lower=0)), "Linear": raw}[size_scale]
+            rng = raw.max() - raw.min()
+            norm = (raw - raw.min()) / rng if rng > 0 else pd.Series(0.5, index=gp.index)
+            gp["SIZE_PX"] = min_px + norm * (max_px - min_px)
+            gp["P&L"] = np.where(gp.NET_REV < 0, "Loss-making", "Earning")
+
+            # labels for the biggest loss-makers
+            gp["LABEL"] = ""
+            if label_n:
+                worst = gp[gp.NET_REV < 0].nsmallest(int(label_n), "NET_REV").index
+                gp.loc[worst, "LABEL"] = gp.loc[worst, "NAME"].str.split(" › ").str[-1].str[:22]
+
+            fig = px.scatter(gp, x="VOLUME", y="Y", color="QUADRANT", size="SIZE_PX", log_x=x_log,
+                             symbol="Shown", symbol_map={"in range": "circle", "clipped (outlier)": "triangle-up"},
+                             color_discrete_map=QUAD_COLORS, category_orders={"QUADRANT": list(QUAD_COLORS)},
+                             hover_name="NAME", text="LABEL",
+                             hover_data={"VOLUME": ":,.0f", "NET_REV": ":,.0f", "MARGIN_BPS": ":+.1f",
+                                         "WTD_MDR": ":.2%", "WTD_IC": ":.2%", "P&L": True, "Y": False,
+                                         "SIZE_PX": False, "Shown": False, "QUADRANT": False, "LABEL": False},
+                             labels={"VOLUME": f"Volume ({PER_LBL}{', log' if x_log else ''})",
+                                     "Y": "Net MDR margin (bps)"},
+                             title=f"Profitability map – {seg_p} · bubble = {size_basis.lower()}"
+                                   + ("" if size_basis == "Equal size" else f" ({size_scale.split(' (')[0].lower()})"))
+            # use SIZE_PX directly as pixel diameter; outline so overlapping bubbles stay distinguishable
+            fig.update_traces(marker=dict(sizemode="diameter", sizeref=1, sizemin=min_px, opacity=0.72,
+                                          line=dict(width=1, color="white")),
+                              textposition="top center", textfont=dict(size=10, color="#333"))
+            # X-axis: fit the data with a little padding so edge bubbles are not cut off
+            vmin, vmax = gp.VOLUME.min(), gp.VOLUME.max()
+            if x_log:
+                fig.update_xaxes(range=[np.log10(vmin) - 0.25, np.log10(vmax) + 0.25])
+            else:
+                xpad = (vmax - vmin) * 0.06 or vmax * 0.1
+                fig.update_xaxes(range=[max(0, vmin - xpad), vmax + xpad])
+            fig.update_yaxes(range=[lo - pad * 1.6, hi + pad * 1.6], zeroline=True, zerolinecolor="#999")
+            fig.add_hline(y=hurdle, line_dash="dash", line_color="grey", annotation_text=f"hurdle {hurdle:+.0f} bps")
+            if vol_cut >= vmin:
+                fig.add_vline(x=vol_cut, line_dash="dash", line_color="grey",
+                              annotation_text=f"high-volume cut-off {fmt_php(vol_cut)}")
+            st.plotly_chart(fig.update_layout(height=700, legend_title_text="", margin=dict(t=60, r=20)),
+                            width="stretch")
+            n_clip = int((gp.Shown != "in range").sum())
+            st.caption(f"Showing {len(gp):,} of {len(g):,} entities · {n_clip} outlier(s) pinned to the edge as ▲ "
+                       "(hover for true margin) · bubble size is relative – use hover for exact ₱ values.")
         qs = (g.groupby("QUADRANT").agg(Entities=("NAME", "count"), Volume=("VOLUME", "sum"), Net=("NET_REV", "sum"))
               .reindex(list(QUAD_COLORS)).fillna(0).reset_index())
         qs["Vol share"] = qs.Volume / tot_v
@@ -700,3 +765,262 @@ if SEC == SECTIONS[2]:
     cB.download_button("Download below-floor list (CSV)", bt.to_csv(index=False).encode(),
                        file_name="below_floor_merchants.csv", key="fl_dl2")
     st.caption("Uplift assumes no volume loss – use ② Repricing Simulator → 'Raise to floor' to test attrition.")
+
+
+# ================================================================ SHARED: granularity options
+def _uniq_labels(names, width=40):
+    """Shorten labels for chart axes and keep them unique (Plotly merges duplicate categories)."""
+    out, seen = [], {}
+    for n in names:
+        s = str(n)
+        s = s if len(s) <= width else "…" + s[-(width - 1):]
+        seen[s] = seen.get(s, 0) + 1
+        out.append(s if seen[s] == 1 else f"{s} ({seen[s]})")
+    return out
+
+
+GRAN = {"All": {"Segment": ["PF_DM_TAG"], "Industry": ["INDUSTRY"],
+                "Segment › Industry": ["PF_DM_TAG", "INDUSTRY"], "Merchant / PF": ["PF_DM_NAME"]},
+        "Direct Merchant": {"Industry": ["INDUSTRY"], "Merchant": ["PF_DM_NAME"],
+                            "Industry › Merchant": ["INDUSTRY", "PF_DM_NAME"]},
+        "Payment Facilitator": {"PF": ["PF_DM_NAME"], "PF › MID": ["PF_DM_NAME", MID_COL],
+                                "Industry": ["INDUSTRY"], "Industry › PF": ["INDUSTRY", "PF_DM_NAME"],
+                                "PF › Sub-merchant": ["PF_DM_NAME", SUB_COL]}}
+
+
+def gran_filters(base, prefix):
+    """Segment + granularity + drill-down filters. Returns (segment, level label, keys, filtered rows)."""
+    cA, cB = st.columns([1.6, 2.4])
+    seg = cA.radio("Segment", list(GRAN), horizontal=True, key=f"{prefix}_seg")
+    lvl = cB.radio("Granularity", list(GRAN[seg]), horizontal=True, key=f"{prefix}_lvl_{seg}")
+    d = base if seg == "All" else base[base.PF_DM_TAG == seg]
+    f1, f2 = st.columns(2)
+    inds = f1.multiselect("Filter industries (blank = all)", sorted(d.INDUSTRY.unique()), key=f"{prefix}_ind_{seg}")
+    if inds:
+        d = d[d.INDUSTRY.isin(inds)]
+    if seg == "Payment Facilitator":
+        pfs = f2.multiselect("Filter PFs (blank = all) – pick one PF + 'PF › MID' to see its MIDs",
+                             sorted(d.PF_DM_NAME.unique()), key=f"{prefix}_pf")
+        if pfs:
+            d = d[d.PF_DM_NAME.isin(pfs)]
+    elif seg == "Direct Merchant":
+        ms = f2.multiselect("Filter merchants (blank = all)", sorted(d.PF_DM_NAME.unique()), key=f"{prefix}_dm")
+        if ms:
+            d = d[d.PF_DM_NAME.isin(ms)]
+    else:
+        segs = f2.multiselect("Filter segments (blank = all)", sorted(d.PF_DM_TAG.unique()), key=f"{prefix}_tag")
+        if segs:
+            d = d[d.PF_DM_TAG.isin(segs)]
+    return seg, lvl, GRAN[seg][lvl], d
+
+
+# ================================================================ ④ REVENUE WATERFALL
+if SEC == SECTIONS[3]:
+    st.caption("Bridges net MDR revenue from ₱0 to the period total: green bars add revenue, red bars take it away. "
+               "Change the granularity / filters to drill down – e.g. Direct Merchant → Industry → one industry → "
+               "Merchant, or Payment Facilitator → one PF → PF › MID.")
+    seg_w, lvl_w, keys, d = gran_filters(dper, "wf")
+    g1, g2, g3 = st.columns([1, 1.6, 1.2])
+    top_n = int(g1.number_input("Bars shown (rest → 'Others')", 3, 40, 15, key="wf_n"))
+    focus = g2.radio("Pick bars by", ["Largest impact (+ or −)", "Biggest losses only"], horizontal=True, key="wf_focus")
+    annual = g3.toggle(f"Annualise (×{ANN:.2f})", value=False, key="wf_ann")
+    g = profit_table(d, keys)
+    if g.empty:
+        st.info("No volume for this selection / period.")
+        st.stop()
+    k = ANN if annual else 1.0
+    g["NET"] = g.NET_REV * k
+    if focus.startswith("Biggest"):
+        pick = g[g.NET < 0].nsmallest(top_n, "NET")
+    else:
+        pick = g.loc[g.NET.abs().sort_values(ascending=False).index].head(top_n)
+    rest = g.drop(pick.index)
+    pos = pick[pick.NET >= 0].sort_values("NET", ascending=False)
+    neg = pick[pick.NET < 0].sort_values("NET", ascending=False)      # small losses first, biggest loss last
+    labels, vals = list(pos.NAME), list(pos.NET)
+    if len(rest):
+        labels.append(f"Others ({len(rest):,})")
+        vals.append(rest.NET.sum())
+    labels += list(neg.NAME)
+    vals += list(neg.NET)
+    total = g.NET.sum()
+    gains, losses = g.loc[g.NET > 0, "NET"].sum(), g.loc[g.NET < 0, "NET"].sum()
+    shown_loss = neg.NET.sum()
+
+    c = st.columns(4)
+    c[0].metric(f"Net MDR revenue ({'annualised' if annual else PER_LBL})", fmt_php(total),
+                f"{g.NET_REV.sum() / g.VOLUME.sum() * 1e4:+.1f} bps of volume", delta_color="off")
+    c[1].metric("Gross gains (earning entities)", fmt_php(gains), f"{int((g.NET > 0).sum()):,} entities", delta_color="off")
+    c[2].metric("Gross losses (loss-making entities)", fmt_php(losses), f"{int((g.NET < 0).sum()):,} entities",
+                delta_color="off")
+    c[3].metric(f"Losses explained by the {len(neg)} red bars", f"{shown_loss / losses:.0%}" if losses else "-",
+                "of gross losses", delta_color="off")
+
+    xl = _uniq_labels(labels) + ["Net total"]
+    fig = go.Figure(go.Waterfall(
+        x=xl, y=vals + [0], measure=["relative"] * len(vals) + ["total"],
+        text=[fmt_php(v) for v in vals] + [fmt_php(total)], textposition="outside",
+        increasing=dict(marker=dict(color="#2E8B57")), decreasing=dict(marker=dict(color="#C0392B")),
+        totals=dict(marker=dict(color="#1F4E79" if total >= 0 else "#7B241C")),
+        connector=dict(line=dict(color="#BBBBBB", width=1)),
+        customdata=labels + ["Net total"], hovertemplate="%{customdata}<br>₱%{y:,.0f}<extra></extra>"))
+    fig.update_layout(title=f"Net MDR revenue waterfall – {seg_w} by {lvl_w.lower()} · "
+                            f"{'annualised' if annual else PER_LBL}",
+                      height=620, showlegend=False, margin=dict(b=160, t=60))
+    fig.update_xaxes(tickangle=-40, type="category")
+    fig.update_yaxes(title="₱", tickformat=",.0f", zeroline=True, zerolinecolor="#888")
+    st.plotly_chart(fig, width="stretch")
+
+    tbl = g.sort_values("NET").copy()
+    tbl["Share of gross loss"] = np.where(tbl.NET < 0, tbl.NET / losses if losses else np.nan, np.nan)
+    tbl["Share of gross gain"] = np.where(tbl.NET > 0, tbl.NET / gains if gains else np.nan, np.nan)
+    cols = ["NAME"] + ([] if "INDUSTRY" in keys else ["INDUSTRY"]) + \
+           ["VOLUME", "WTD_MDR", "WTD_IC", "MARGIN_BPS", "NET", "Share of gross loss", "Share of gross gain"]
+    tbl = tbl[cols].rename(columns={"NAME": lvl_w, "INDUSTRY": "Main industry", "VOLUME": "Volume",
+                                    "WTD_MDR": "Wtd MDR", "WTD_IC": "Wtd IC", "MARGIN_BPS": "Margin (bps)",
+                                    "NET": "Net MDR revenue"})
+    money_table(tbl, {"Volume": "{:,.0f}", "Wtd MDR": "{:.2%}", "Wtd IC": "{:.2%}", "Margin (bps)": "{:+.1f}",
+                      "Net MDR revenue": "{:+,.0f}", "Share of gross loss": "{:.1%}",
+                      "Share of gross gain": "{:.1%}"}, height=380)
+    st.download_button("Download waterfall data (CSV)", tbl.to_csv(index=False).encode(),
+                       file_name=f"waterfall_{seg_w}_{lvl_w}.csv".replace(" ", "_").replace("›", "-"), key="wf_dl")
+
+# ================================================================ ⑤ MARGIN TREND
+if SEC == SECTIONS[4]:
+    st.caption("Monthly net MDR margin (bps of volume) per entity. Separates merchants whose margin is **slipping** "
+               "(fixable by repricing back) from those that are **structurally** below hurdle (need a floor / exit "
+               "decision). This view uses its own month window, not the sidebar period.")
+    t1, t2, t3, t4 = st.columns(4)
+    n_m = t1.selectbox("Months shown (ending reporting month)", [6, 12, 18, 24], index=1, key="tr_nm")
+    hurdle_t = t2.number_input("Margin hurdle (bps)", value=0.0, step=5.0, key="tr_hurdle")
+    thr = t3.number_input("Trend threshold (bps / month)", value=2.0, step=0.5, min_value=0.1, key="tr_thr",
+                          help="Slope steeper than this = Deteriorating / Improving; otherwise Stable.")
+    min_v = t4.number_input("Min. volume in window (₱)", value=0.0, step=100000.0, key="tr_minv")
+    mlist = [m for m in MONTHS if prev_month(cur_m, n_m - 1) <= m <= cur_m]
+    seg_t, lvl_t, keys, d = gran_filters(df[df.YEAR_MONTH.isin(mlist)], "tr")
+
+    tot = profit_table(d, keys)
+    tot = tot[tot.VOLUME >= min_v]
+    if tot.empty:
+        st.info("No volume for this selection / window.")
+        st.stop()
+    m = profit_table(d[d.set_index(keys).index.isin(tot.set_index(keys).index)] if len(keys) > 1
+                     else d[d[keys[0]].isin(tot[keys[0]])], keys + ["YEAR_MONTH"])
+    m["NAME"] = m[keys].astype(str).agg(" › ".join, axis=1)
+    piv = m.pivot_table(index="NAME", columns="YEAR_MONTH", values="MARGIN_BPS").reindex(columns=mlist)
+    vpiv = m.pivot_table(index="NAME", columns="YEAR_MONTH", values="VOLUME").reindex(columns=mlist)
+
+    def _stats(row):
+        s = row.dropna()
+        x = np.array([mlist.index(c) for c in s.index], dtype=float)
+        slope = np.polyfit(x, s.values, 1)[0] if len(s) >= 3 else np.nan
+        f3, l3 = s.iloc[:3].mean(), s.iloc[-3:].mean()
+        nb = int((s < hurdle_t).sum())
+        if len(s) < 3:
+            lab = "New / sparse (<3 months)"
+        elif nb == len(s):
+            lab = "Structural – always below hurdle"
+        elif l3 < hurdle_t <= f3:
+            lab = "Slipped below hurdle"
+        elif slope <= -thr:
+            lab = "Deteriorating"
+        elif slope >= thr:
+            lab = "Improving"
+        else:
+            lab = "Stable"
+        return pd.Series({"Trend": lab, "Slope (bps/mo)": slope, "First 3m avg (bps)": f3, "Last 3m avg (bps)": l3,
+                          "Change (bps)": l3 - f3, "Months below hurdle": nb, "Active months": len(s)})
+
+    st_tbl = piv.apply(_stats, axis=1).reset_index()
+    st_tbl = st_tbl.merge(tot[["NAME", "VOLUME", "NET_REV", "MARGIN_BPS", "INDUSTRY"]], on="NAME", how="left")
+    TREND_COLORS = {"Structural – always below hurdle": "#7B241C", "Slipped below hurdle": "#C0392B",
+                    "Deteriorating": "#F2994A", "Stable": "#A9B8C9", "Improving": "#2E8B57",
+                    "New / sparse (<3 months)": "#BDBDBD"}
+
+    ts = (st_tbl.groupby("Trend").agg(Entities=("NAME", "count"), Volume=("VOLUME", "sum"), Net=("NET_REV", "sum"))
+          .reindex([t for t in TREND_COLORS if t in set(st_tbl.Trend)]).reset_index())
+    ts["Vol share"] = ts.Volume / ts.Volume.sum()
+    c1, c2 = st.columns([1.3, 1])
+    c1.plotly_chart(px.bar(ts, x="Trend", y="Net", color="Trend", color_discrete_map=TREND_COLORS,
+                           text=ts.Net.map(fmt_php), hover_data={"Entities": True, "Vol share": ":.1%"},
+                           title=f"Net MDR revenue by trend group – last {len(mlist)} months")
+                    .update_layout(height=380, showlegend=False).update_xaxes(title=None)
+                    .update_yaxes(title="₱", tickformat=",.0f"), width="stretch")
+    with c2:
+        st.markdown("##### Trend groups")
+        money_table(ts.rename(columns={"Net": "Net MDR revenue"}),
+                    {"Entities": "{:,.0f}", "Volume": "{:,.0f}", "Net MDR revenue": "{:+,.0f}", "Vol share": "{:.1%}"})
+
+    # ---- line chart for selected entities
+    st.markdown("##### Margin trend – selected entities")
+    watch = st_tbl[st_tbl.Trend.isin(["Structural – always below hurdle", "Slipped below hurdle", "Deteriorating"])]
+    default = (watch if len(watch) else st_tbl).nlargest(5, "VOLUME").NAME.tolist()
+    s1, s2 = st.columns([3, 1])
+    sel = s1.multiselect("Entities (default = 5 largest on the watch-list)",
+                         st_tbl.sort_values("VOLUME", ascending=False).NAME.tolist(), default=default,
+                         key=f"tr_sel_{seg_t}_{lvl_t}")
+    show_port = s2.toggle("Show selection total line", value=True, key="tr_port")
+    if sel:
+        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.68, 0.32], vertical_spacing=0.06,
+                            subplot_titles=("Net MDR margin (bps)", "Volume (₱)"))
+        pal = px.colors.qualitative.Bold + px.colors.qualitative.Safe
+        for i, nm in enumerate(sel):
+            col = pal[i % len(pal)]
+            short = _uniq_labels([nm], 45)[0]
+            fig.add_trace(go.Scatter(x=mlist, y=piv.loc[nm], mode="lines+markers", name=short, legendgroup=nm,
+                                     line=dict(color=col, width=2.5), connectgaps=False,
+                                     hovertemplate=f"{nm}<br>%{{x}}: %{{y:+.1f}} bps<extra></extra>"), row=1, col=1)
+            fig.add_trace(go.Bar(x=mlist, y=vpiv.loc[nm], name=short, legendgroup=nm, showlegend=False,
+                                 marker_color=col, opacity=0.75,
+                                 hovertemplate=f"{nm}<br>%{{x}}: ₱%{{y:,.0f}}<extra></extra>"), row=2, col=1)
+        if show_port:
+            pm = m[m.NAME.isin(sel)].groupby("YEAR_MONTH")[["NET_REV", "VOLUME"]].sum().reindex(mlist)
+            fig.add_trace(go.Scatter(x=mlist, y=pm.NET_REV / pm.VOLUME * 1e4, mode="lines", name="Selection total",
+                                     line=dict(color="black", dash="dash", width=2),
+                                     hovertemplate="Selection total<br>%{x}: %{y:+.1f} bps<extra></extra>"),
+                          row=1, col=1)
+        fig.add_hline(y=hurdle_t, line_dash="dot", line_color="grey", annotation_text=f"hurdle {hurdle_t:+.0f} bps",
+                      row=1, col=1)
+        if LATEST_M in mlist and PARTIAL:
+            fig.add_vrect(x0=mlist.index(LATEST_M) - 0.5, x1=mlist.index(LATEST_M) + 0.5, fillcolor=RR_COLOR,
+                          opacity=0.08, line_width=0, annotation_text=f"partial to {card_asof:%b %d}",
+                          annotation_position="top left")
+        fig.update_xaxes(type="category")
+        fig.update_layout(height=640, barmode="group", legend=dict(orientation="h", y=-0.12),
+                          margin=dict(t=40))
+        st.plotly_chart(fig, width="stretch")
+        st.caption("Margin in the partial month is not run-rated (bps are a ratio); volume in the partial month is "
+                   "actual-to-date.")
+
+    # ---- heatmap
+    st.markdown("##### Margin heatmap (bps) – entity × month")
+    h1, h2 = st.columns([3, 1])
+    tf = h1.multiselect("Trend groups in heatmap", list(TREND_COLORS),
+                        default=["Structural – always below hurdle", "Slipped below hurdle", "Deteriorating"],
+                        key="tr_hm_tf")
+    hn = int(h2.number_input("Rows (largest volume)", 5, 60, 25, key="tr_hm_n"))
+    hm_names = st_tbl[st_tbl.Trend.isin(tf)].nlargest(hn, "VOLUME").NAME.tolist()
+    if hm_names:
+        hm = piv.loc[hm_names]
+        vals = hm.values[~np.isnan(hm.values)]
+        span = max(abs(np.percentile(vals, 5) - hurdle_t), abs(np.percentile(vals, 95) - hurdle_t), 5)
+        hm.index = _uniq_labels(hm.index, 45)
+        fh = px.imshow(hm, color_continuous_scale="RdYlGn", range_color=[hurdle_t - span, hurdle_t + span],
+                       aspect="auto", text_auto=".0f", labels=dict(color="bps", x="", y=""))
+        fh.update_xaxes(type="category", side="top")
+        st.plotly_chart(fh.update_layout(height=max(320, 26 * len(hm_names) + 120)), width="stretch")
+    else:
+        st.info("No entities in the chosen trend groups.")
+
+    out = st_tbl.sort_values(["Trend", "VOLUME"], ascending=[True, False])[
+        ["NAME", "Trend", "INDUSTRY", "VOLUME", "NET_REV", "MARGIN_BPS", "First 3m avg (bps)", "Last 3m avg (bps)",
+         "Change (bps)", "Slope (bps/mo)", "Months below hurdle", "Active months"]].rename(
+        columns={"NAME": lvl_t, "INDUSTRY": "Main industry", "VOLUME": "Volume (window)",
+                 "NET_REV": "Net MDR revenue (window)", "MARGIN_BPS": "Margin (bps, window)"})
+    money_table(out, {"Volume (window)": "{:,.0f}", "Net MDR revenue (window)": "{:+,.0f}",
+                      "Margin (bps, window)": "{:+.1f}", "First 3m avg (bps)": "{:+.1f}",
+                      "Last 3m avg (bps)": "{:+.1f}", "Change (bps)": "{:+.1f}", "Slope (bps/mo)": "{:+.2f}"},
+                height=380)
+    st.download_button("Download margin trend table (CSV)", out.to_csv(index=False).encode(),
+                       file_name=f"margin_trend_{seg_t}_{lvl_t}.csv".replace(" ", "_").replace("›", "-"),
+                       key="tr_dl")
